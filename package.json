@@ -1,6 +1,6 @@
 {
-  "name": "@stukennedy/honi",
-  "version": "0.3.0",
+  "name": "honi-cf",
+  "version": "0.4.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
