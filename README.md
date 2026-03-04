@@ -20,7 +20,7 @@ bun add honi
 
 ```typescript
 // src/index.ts
-import { createAgent, tool, z } from 'honi';
+import { createAgent, tool, z } from '@stukennedy/honi';
 
 const searchCRM = tool({
   name: 'search_crm',
