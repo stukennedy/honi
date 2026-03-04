@@ -7,7 +7,7 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "@stukennedy/honi": "^0.2.0"
+    "honi-cf": "^0.2.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240405.0",
