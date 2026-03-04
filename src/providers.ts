@@ -1,5 +1,6 @@
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
+import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import type { LanguageModel } from 'ai';
 
 export interface ProviderOptions {
@@ -19,6 +20,15 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
     const apiKey = options?.env?.ANTHROPIC_API_KEY as string | undefined;
     if (apiKey) providerOptions.apiKey = apiKey;
     const provider = createAnthropic(providerOptions);
+    return provider(modelId);
+  }
+
+  if (modelId.startsWith('gemini-')) {
+    const providerOptions: { baseURL?: string; apiKey?: string } = {};
+    if (gatewayUrl) providerOptions.baseURL = gatewayUrl;
+    const apiKey = options?.env?.GOOGLE_AI_API_KEY as string | undefined;
+    if (apiKey) providerOptions.apiKey = apiKey;
+    const provider = createGoogleGenerativeAI(providerOptions);
     return provider(modelId);
   }
 
@@ -52,6 +62,6 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   }
 
   throw new Error(
-    `Unsupported model: "${modelId}". Use a claude-*, gpt-*, or @cf/* model ID.`,
+    `Unsupported model: "${modelId}". Use a claude-*, gpt-*, gemini-*, or @cf/* model ID.`,
   );
 }
