@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import type { ObservabilityConfig } from './observability.js';
 
 export interface ToolDefinition<T extends z.ZodType = z.ZodType> {
   name: string;
@@ -44,4 +45,6 @@ export interface AgentConfig {
   binding?: string;
   /** Max tool-call loop iterations. Defaults to 10. */
   maxSteps?: number;
+  /** Observability configuration (event collection, AI Gateway). */
+  observability?: ObservabilityConfig;
 }

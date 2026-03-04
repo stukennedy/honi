@@ -11,3 +11,11 @@ export type {
   EpisodicConfig,
   SemanticConfig,
 } from './types.js';
+
+// Phase 3 — Workflows
+export { workflow, step } from './workflow.js';
+export type { WorkflowStepDef, HoniWorkflowConfig, StepConfig } from './workflow.js';
+
+// Phase 5 — Observability
+export { ObservabilityCollector, createObservability } from './observability.js';
+export type { ObservabilityConfig, HoniEvent, HoniEventType } from './observability.js';

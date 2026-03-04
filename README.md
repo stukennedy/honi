@@ -212,6 +212,106 @@ const { messages, input, handleSubmit } = useChat({
 | **Tool system** | Zod-native           | Zod-native       | Mixed      |
 | **Framework**   | Hono                 | Express / Hono   | Custom     |
 
+## Workflows (Phase 3)
+
+Honi wraps [Cloudflare Workflows](https://developers.cloudflare.com/workflows/) with a simple `workflow()` + `step()` API for durable, multi-step agent pipelines.
+
+```typescript
+import { workflow, step } from '@stukennedy/honi';
+
+const IngestWorkflow = workflow({
+  steps: [
+    step({ name: 'fetch-data', retries: { limit: 3, backoff: 'exponential' } }, async (input, step) => {
+      const res = await fetch(input.url);
+      return res.json();
+    }),
+    step({ name: 'process', timeout: '60s' }, async (data, step) => {
+      return { processed: true, items: data.length };
+    }),
+  ],
+  onComplete: async (result, env) => {
+    console.log('Pipeline complete:', result);
+  },
+  onError: async (error, env) => {
+    console.error('Pipeline failed:', error.message);
+  },
+});
+
+export { IngestWorkflow };
+```
+
+Add to `wrangler.toml`:
+
+```toml
+[[workflows]]
+name = "ingest-workflow"
+binding = "INGEST_WORKFLOW"
+class_name = "IngestWorkflow"
+```
+
+## CLI (Phase 4)
+
+Honi includes a CLI for scaffolding and managing projects.
+
+```bash
+# Install globally
+npm install -g @stukennedy/honi
+
+# Create a new project
+honi new my-sales-coach
+
+# Start local dev server
+honi dev
+
+# Deploy to Cloudflare Workers
+honi deploy
+```
+
+`honi new` generates a ready-to-run project with `src/index.ts`, `wrangler.toml`, `tsconfig.json`, and `package.json`.
+
+## Observability (Phase 5)
+
+Honi emits structured events for every agent request, tool call, memory operation, and workflow step.
+
+### Configuration
+
+```typescript
+const agent = createAgent({
+  name: 'my-agent',
+  model: 'claude-sonnet-4-5',
+  observability: {
+    logLevel: 'debug',
+    onEvent: (event) => {
+      // Send to your logging/analytics service
+      console.log(event.type, event.durationMs);
+    },
+    aiGateway: {
+      accountId: 'your-cf-account-id',
+      gatewayId: 'your-gateway-id',
+    },
+  },
+});
+```
+
+### Event Types
+
+| Event | Emitted When |
+| --- | --- |
+| `agent.request` | Incoming chat request |
+| `agent.response` | Response stream complete |
+| `tool.call` | Tool execution starts |
+| `tool.result` | Tool execution finishes |
+| `memory.load` | Memory loaded from storage |
+| `memory.save` | Memory persisted |
+| `workflow.start` | Workflow begins |
+| `workflow.step` | Workflow step executes |
+| `workflow.complete` | Workflow finishes |
+| `workflow.error` | Workflow errors |
+
+### AI Gateway
+
+Set `observability.aiGateway` to route LLM calls through [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/) for logging, rate limiting, and caching at the edge.
+
 ## API Reference
 
 ### `createAgent(config)`

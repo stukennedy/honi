@@ -4,16 +4,52 @@ import { resolveModel } from './providers.js';
 import { ThreadMemory } from './memory.js';
 import { EpisodicMemory } from './episodic.js';
 import { SemanticMemory } from './semantic.js';
+import { ObservabilityCollector } from './observability.js';
 import type { AgentConfig, ToolDefinition } from './types.js';
 
-function buildTools(tools: ToolDefinition[]) {
+function buildTools(tools: ToolDefinition[], collector?: ObservabilityCollector, agentName?: string, threadId?: string) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const result: Record<string, any> = {};
   for (const t of tools) {
     result[t.name] = aiTool({
       description: t.description,
       parameters: t.input,
-      execute: async (args) => t.handler(args),
+      execute: async (args) => {
+        if (collector) {
+          const start = Date.now();
+          collector.emit({
+            type: 'tool.call',
+            agentName: agentName!,
+            threadId,
+            timestamp: start,
+            metadata: { tool: t.name, args },
+          });
+          try {
+            const toolResult = await t.handler(args);
+            collector.emit({
+              type: 'tool.result',
+              agentName: agentName!,
+              threadId,
+              timestamp: Date.now(),
+              durationMs: Date.now() - start,
+              metadata: { tool: t.name },
+            });
+            return toolResult;
+          } catch (err) {
+            collector.emit({
+              type: 'tool.result',
+              agentName: agentName!,
+              threadId,
+              timestamp: Date.now(),
+              durationMs: Date.now() - start,
+              metadata: { tool: t.name },
+              error: (err as Error).message,
+            });
+            throw err;
+          }
+        }
+        return t.handler(args);
+      },
     });
   }
   return result;
@@ -22,6 +58,11 @@ function buildTools(tools: ToolDefinition[]) {
 export function createAgent(config: AgentConfig) {
   const binding = config.binding ?? 'AGENT';
   const maxSteps = config.maxSteps ?? 10;
+
+  // Create observability collector if configured
+  const collector = config.observability
+    ? new ObservabilityCollector(config.observability)
+    : undefined;
 
   class AgentDO implements DurableObject {
     /** @internal */ memory: ThreadMemory;
@@ -88,9 +129,23 @@ export function createAgent(config: AgentConfig) {
       }
 
       // POST — chat
+      const requestStart = Date.now();
       const body = (await request.json()) as { message: string };
+
+      if (collector) {
+        collector.emit({
+          type: 'agent.request',
+          agentName: config.name,
+          threadId,
+          timestamp: requestStart,
+          metadata: { messageLength: body.message.length },
+        });
+      }
+
       const model = resolveModel(config.model);
-      const tools = config.tools?.length ? buildTools(config.tools) : undefined;
+      const tools = config.tools?.length
+        ? buildTools(config.tools, collector, config.name, threadId)
+        : undefined;
 
       // Load history: prefer episodic (D1) if available, else DO storage
       const episodicLimit = config.memory?.episodic?.limit ?? 50;
@@ -132,6 +187,16 @@ export function createAgent(config: AgentConfig) {
         tools,
         maxSteps,
         onFinish: async ({ response }) => {
+          if (collector) {
+            collector.emit({
+              type: 'agent.response',
+              agentName: config.name,
+              threadId,
+              timestamp: Date.now(),
+              durationMs: Date.now() - requestStart,
+            });
+          }
+
           const newMessages: CoreMessage[] = [
             { role: 'user' as const, content: body.message },
             ...(response.messages as CoreMessage[]),
