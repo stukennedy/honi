@@ -13,7 +13,7 @@ Honi is a lightweight framework for building agentic AI applications on Cloudfla
 ### Install
 
 ```bash
-bun add honi
+bun add @stukennedy/honi
 ```
 
 ### Create an Agent
@@ -396,3 +396,76 @@ Returns `{ fetch, DurableObject }`.
 ## License
 
 MIT
+
+## Bundle Size
+
+Honi is designed to fit comfortably within Cloudflare Workers' limits:
+
+| Component | Size |
+|-----------|------|
+| Honi library (dist/) | ~30 KB |
+| Full demo app (with AI SDK) | 691 KB uncompressed |
+| **Gzip compressed** | **123 KB** |
+| **CF Workers limit** | **1 MB compressed** |
+
+You're using ~12% of the limit with a full-featured agent including all AI SDK providers.
+
+### Optimization Tips
+
+- Only import the providers you need (`@ai-sdk/anthropic` OR `@ai-sdk/openai`, not both)
+- Use Workers AI (`@cf/` models) to skip external provider SDKs entirely
+- Tree-shaking works — unused features don't add to bundle size
+
+## MCP Server
+
+Honi agents can expose their tools as MCP endpoints, allowing connection from Claude Desktop, Cursor, and other MCP-compatible clients.
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/mcp` | POST | JSON-RPC 2.0 MCP endpoint |
+| `/mcp/tools` | GET | List available tools (convenience) |
+
+### Example: Connect from Claude Desktop
+
+Add to your Claude Desktop MCP config:
+
+```json
+{
+  "mcpServers": {
+    "my-honi-agent": {
+      "url": "https://my-agent.workers.dev/mcp"
+    }
+  }
+}
+```
+
+## Multi-Agent Orchestration
+
+Honi supports agent-to-agent communication for building complex agentic workflows.
+
+```typescript
+import { routeToAgent, callAgentTool, listAgentTools } from '@stukennedy/honi';
+
+// Send a message to another agent
+const response = await routeToAgent(env, { binding: 'OTHER_AGENT' }, 'Hello!');
+
+// Call a specific tool on another agent
+const result = await callAgentTool(env, { binding: 'OTHER_AGENT' }, 'search', { query: 'test' });
+
+// List available tools from another agent
+const tools = await listAgentTools(env, { binding: 'OTHER_AGENT' });
+```
+
+### wrangler.toml Setup
+
+```toml
+[[durable_objects.bindings]]
+name = "MY_AGENT"
+class_name = "MyAgentDO"
+
+[[durable_objects.bindings]]
+name = "OTHER_AGENT"
+class_name = "OtherAgentDO"
+```
