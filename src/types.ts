@@ -7,8 +7,31 @@ export interface ToolDefinition<T extends z.ZodType = z.ZodType> {
   handler: (input: z.infer<T>) => Promise<unknown>;
 }
 
-export interface MemoryConfig {
+export interface EpisodicConfig {
   enabled: boolean;
+  /** D1Database binding name in wrangler.toml. Defaults to "DB". */
+  binding?: string;
+  /** Number of messages to load from D1. Defaults to 50. */
+  limit?: number;
+}
+
+export interface SemanticConfig {
+  enabled: boolean;
+  /** VectorizeIndex binding name in wrangler.toml. Defaults to "VECTORIZE". */
+  binding?: string;
+  /** AI binding name in wrangler.toml. Defaults to "AI". */
+  aiBinding?: string;
+  /** Number of semantic results to inject. Defaults to 3. */
+  topK?: number;
+}
+
+export interface MemoryConfig {
+  /** Enable DO-based working memory. */
+  enabled?: boolean;
+  /** D1-backed episodic memory (durable conversation history). */
+  episodic?: EpisodicConfig;
+  /** Vectorize-backed semantic memory (similarity search). */
+  semantic?: SemanticConfig;
 }
 
 export interface AgentConfig {

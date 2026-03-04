@@ -77,6 +77,64 @@ curl -X POST https://your-worker.workers.dev/chat \
   -d '{"message": "What deals are closing this week?"}'
 ```
 
+## Memory (Phase 2)
+
+Honi supports three tiers of memory, all opt-in:
+
+| Tier | Backing | Survives DO eviction? | Queryable across threads? |
+| --- | --- | --- | --- |
+| **Working** | Durable Object storage | No | No |
+| **Episodic** | D1 | Yes | Yes |
+| **Semantic** | Vectorize + Workers AI | Yes | Yes (similarity search) |
+
+### Setup
+
+Add bindings to your `wrangler.toml`:
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "honi-memory"
+database_id = "YOUR_DB_ID"
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "honi-semantic"
+dimensions = 768
+metric = "cosine"
+
+[ai]
+binding = "AI"
+```
+
+Run the D1 migration:
+
+```bash
+wrangler d1 migrations apply honi-memory
+```
+
+### Configure
+
+```typescript
+const agent = createAgent({
+  name: 'my-agent',
+  model: 'claude-sonnet-4-5',
+  memory: {
+    enabled: true,              // DO working memory
+    episodic: { enabled: true },        // D1 conversation history
+    semantic: { enabled: true, topK: 3 }, // Vectorize RAG context
+  },
+  system: 'You are a helpful assistant.',
+});
+```
+
+Episodic and semantic memory are fully opt-in. If the required bindings are missing, Honi logs a warning and falls back to DO-only memory.
+
+### How it works
+
+1. **On each request**: past messages load from D1 (episodic) and the user message is embedded and searched against Vectorize (semantic). Top-K relevant results are prepended to the system prompt.
+2. **After each response**: the conversation turn is saved to D1 and both user + assistant messages are embedded and upserted to Vectorize for future retrieval.
+
 ## Core Concepts
 
 ### Agents
@@ -163,7 +221,7 @@ const { messages, input, handleSubmit } = useChat({
 | `name`     | `string`              | —                 | Agent name                                 |
 | `model`    | `string`              | —                 | Model ID (`claude-sonnet-4-5`, `gpt-4o`)   |
 | `system`   | `string`              | —                 | System prompt                              |
-| `memory`   | `{ enabled: boolean }`| `{ enabled: false }` | Enable DO-backed memory                 |
+| `memory`   | `MemoryConfig`        | `{}`                 | Memory configuration (see Phase 2)      |
 | `tools`    | `ToolDefinition[]`    | `[]`              | Agent tools                                |
 | `binding`  | `string`              | `"AGENT"`         | Durable Object binding name                |
 | `maxSteps` | `number`              | `10`              | Max tool-calling loop iterations           |
