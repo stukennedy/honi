@@ -10,13 +10,14 @@
         "ai": "^4.0.0",
         "hono": "^4.0.0",
         "zod": "^3.23.0",
+        "zod-to-json-schema": "^3.25.1",
       },
       "devDependencies": {
         "@cloudflare/workers-types": "^4.20240405.0",
         "typescript": "^5.5.0",
       },
       "peerDependencies": {
-        "@ai-sdk/cloudflare": "",
+        "@ai-sdk/cloudflare": ">=0.0.1",
       },
       "optionalPeers": [
         "@ai-sdk/cloudflare",

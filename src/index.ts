@@ -23,3 +23,7 @@ export type { WorkflowStepDef, HoniWorkflowConfig, StepConfig } from './workflow
 // Phase 5 — Observability
 export { ObservabilityCollector, createObservability } from './observability.js';
 export type { ObservabilityConfig, HoniEvent, HoniEventType } from './observability.js';
+
+// MCP Server
+export { createMcpServer, toolsToMcp, MCP_ERRORS } from './mcp.js';
+export type { McpServer, McpRequest, McpResponse, McpToolInfo } from './mcp.js';

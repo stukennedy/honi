@@ -5,6 +5,7 @@ import { ThreadMemory } from './memory.js';
 import { EpisodicMemory } from './episodic.js';
 import { SemanticMemory } from './semantic.js';
 import { ObservabilityCollector } from './observability.js';
+import { createMcpServer } from './mcp.js';
 import type { AgentConfig, ToolDefinition } from './types.js';
 
 function buildTools(tools: ToolDefinition[], collector?: ObservabilityCollector, agentName?: string, threadId?: string) {
@@ -126,6 +127,13 @@ export function createAgent(config: AgentConfig) {
         return new Response(JSON.stringify({ ok: true }), {
           headers: { 'content-type': 'application/json' },
         });
+      }
+
+      // POST /mcp — MCP server endpoint
+      const url = new URL(request.url);
+      if (request.method === 'POST' && url.pathname.endsWith('/mcp')) {
+        const mcpServer = createMcpServer(config.tools ?? []);
+        return mcpServer.handleHttp(request);
       }
 
       // POST — chat
@@ -285,6 +293,29 @@ export function createAgent(config: AgentConfig) {
     const id = ns.idFromName(threadId);
     const stub = ns.get(id);
     return stub.fetch(new Request('https://do/history', { method: 'DELETE' }));
+  });
+
+  // MCP Server endpoint — exposes agent tools to MCP clients
+  app.post('/mcp', async (c) => {
+    const env = c.env as Record<string, DurableObjectNamespace>;
+    const ns = env[binding];
+    if (!ns) {
+      return c.json({ error: `Missing Durable Object binding: "${binding}"` }, 500);
+    }
+    const threadId = c.req.header('x-thread-id') ?? c.req.query('threadId') ?? 'default';
+    const id = ns.idFromName(threadId);
+    const stub = ns.get(id);
+    return stub.fetch(new Request('https://do/mcp', { 
+      method: 'POST', 
+      body: await c.req.text(),
+      headers: { 'content-type': 'application/json' }
+    }));
+  });
+
+  // MCP tools list (convenience GET endpoint)
+  app.get('/mcp/tools', async (c) => {
+    const mcpServer = createMcpServer(config.tools ?? []);
+    return c.json({ tools: mcpServer.tools });
   });
 
   const fetchHandler: ExportedHandlerFetchHandler = (req, env, ctx) =>
