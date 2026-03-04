@@ -1,0 +1,11 @@
+name = "sales-coach-agent"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[[durable_objects.bindings]]
+name = "SALES_COACH_DO"
+class_name = "SalesCoachDO"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["SalesCoachDO"]
