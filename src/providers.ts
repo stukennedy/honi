@@ -13,15 +13,20 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   const gatewayUrl = options?.gatewayUrl;
 
   if (modelId.startsWith('claude-')) {
-    const providerOptions: { baseURL?: string } = {};
+    const providerOptions: { baseURL?: string; apiKey?: string } = {};
     if (gatewayUrl) providerOptions.baseURL = gatewayUrl;
+    // In CF Workers, secrets live in env — process.env is not populated
+    const apiKey = options?.env?.ANTHROPIC_API_KEY as string | undefined;
+    if (apiKey) providerOptions.apiKey = apiKey;
     const provider = createAnthropic(providerOptions);
     return provider(modelId);
   }
 
   if (modelId.startsWith('gpt-')) {
-    const providerOptions: { baseURL?: string } = {};
+    const providerOptions: { baseURL?: string; apiKey?: string } = {};
     if (gatewayUrl) providerOptions.baseURL = gatewayUrl;
+    const apiKey = options?.env?.OPENAI_API_KEY as string | undefined;
+    if (apiKey) providerOptions.apiKey = apiKey;
     const provider = createOpenAI(providerOptions);
     return provider(modelId);
   }
