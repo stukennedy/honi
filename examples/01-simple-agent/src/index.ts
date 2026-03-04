@@ -1,4 +1,4 @@
-import { createAgent } from 'honi-cf';
+import { createAgent } from '@stukennedy/honi';
 
 const agent = createAgent({
   name: 'simple-agent',

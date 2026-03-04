@@ -20,7 +20,7 @@ bun add honi
 
 ```typescript
 // src/index.ts
-import { createAgent, tool, z } from 'honi-cf';
+import { createAgent, tool, z } from '@stukennedy/honi';
 
 const searchCRM = tool({
   name: 'search_crm',
@@ -273,7 +273,7 @@ Each example includes a `wrangler.toml`, `package.json`, and README with setup i
 Honi wraps [Cloudflare Workflows](https://developers.cloudflare.com/workflows/) with a simple `workflow()` + `step()` API for durable, multi-step agent pipelines.
 
 ```typescript
-import { workflow, step } from 'honi-cf';
+import { workflow, step } from '@stukennedy/honi';
 
 const IngestWorkflow = workflow({
   steps: [
@@ -311,7 +311,7 @@ Honi includes a CLI for scaffolding and managing projects.
 
 ```bash
 # Install globally
-npm install -g honi-cf
+npm install -g @stukennedy/honi
 
 # Create a new project
 honi new my-sales-coach

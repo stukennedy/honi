@@ -1,4 +1,4 @@
-import { createAgent, workflow, step, tool } from 'honi-cf';
+import { createAgent, workflow, step, tool } from '@stukennedy/honi';
 import { z } from 'zod';
 
 // Tools for the agent
