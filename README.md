@@ -212,6 +212,18 @@ const { messages, input, handleSubmit } = useChat({
 | **Tool system** | Zod-native           | Zod-native       | Mixed      |
 | **Framework**   | Hono                 | Express / Hono   | Custom     |
 
+## Examples
+
+Ready-to-deploy example projects in the [`examples/`](./examples) directory:
+
+| Example | Description |
+| --- | --- |
+| [`01-simple-agent`](./examples/01-simple-agent) | Minimal hello-world agent with Durable Object memory |
+| [`02-rag-agent`](./examples/02-rag-agent) | Full tiered memory — episodic (D1) + semantic RAG (Vectorize) |
+| [`03-research-workflow`](./examples/03-research-workflow) | Multi-step research pipeline using Cloudflare Workflows |
+
+Each example includes a `wrangler.toml`, `package.json`, and README with setup instructions.
+
 ## Workflows (Phase 3)
 
 Honi wraps [Cloudflare Workflows](https://developers.cloudflare.com/workflows/) with a simple `workflow()` + `step()` API for durable, multi-step agent pipelines.

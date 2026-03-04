@@ -1,0 +1,28 @@
+name = "rag-agent"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[[durable_objects.bindings]]
+name = "AGENT"
+class_name = "RagAgentDO"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["RagAgentDO"]
+
+# D1 — episodic memory (conversation history)
+[[d1_databases]]
+binding = "DB"
+database_name = "honi-memory"
+database_id = "YOUR_DB_ID"
+
+# Vectorize — semantic memory (RAG)
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "honi-semantic"
+dimensions = 768
+metric = "cosine"
+
+# Workers AI — embedding model for semantic search
+[ai]
+binding = "AI"

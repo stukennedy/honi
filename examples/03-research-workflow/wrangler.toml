@@ -1,0 +1,17 @@
+name = "research-workflow"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[[durable_objects.bindings]]
+name = "AGENT"
+class_name = "ResearchAgentDO"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["ResearchAgentDO"]
+
+# Workflow binding
+[[workflows]]
+name = "research-workflow"
+binding = "RESEARCH_WORKFLOW"
+class_name = "ResearchWorkflow"
