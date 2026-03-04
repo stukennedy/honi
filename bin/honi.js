@@ -54,7 +54,7 @@ function createProject(name) {
       deploy: 'wrangler deploy',
       typecheck: 'tsc --noEmit',
     },
-    dependencies: { '@stukennedy/honi': 'latest' },
+    dependencies: { 'honidev': 'latest' },
     devDependencies: { '@cloudflare/workers-types': 'latest', typescript: 'latest', wrangler: 'latest' },
   }, null, 2));
 
@@ -85,7 +85,7 @@ new_classes = ["AgentDO"]
 
   // src/index.ts
   mkdirSync(`${name}/src`, { recursive: true });
-  writeFileSync(`${name}/src/index.ts`, `import { createAgent } from '@stukennedy/honi';
+  writeFileSync(`${name}/src/index.ts`, `import { createAgent } from 'honidev';
 
 const agent = createAgent({
   name: '${name}',

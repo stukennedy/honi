@@ -1,4 +1,4 @@
-import { createAgent, tool } from '@stukennedy/honi';
+import { createAgent, tool } from 'honidev';
 import { z } from 'zod';
 
 const saveNote = tool({

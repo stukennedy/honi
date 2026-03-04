@@ -13,14 +13,14 @@ Honi is a lightweight framework for building agentic AI applications on Cloudfla
 ### Install
 
 ```bash
-bun add @stukennedy/honi
+bun add honidev
 ```
 
 ### Create an Agent
 
 ```typescript
 // src/index.ts
-import { createAgent, tool, z } from '@stukennedy/honi';
+import { createAgent, tool, z } from 'honidev';
 
 const searchCRM = tool({
   name: 'search_crm',
@@ -273,7 +273,7 @@ Each example includes a `wrangler.toml`, `package.json`, and README with setup i
 Honi wraps [Cloudflare Workflows](https://developers.cloudflare.com/workflows/) with a simple `workflow()` + `step()` API for durable, multi-step agent pipelines.
 
 ```typescript
-import { workflow, step } from '@stukennedy/honi';
+import { workflow, step } from 'honidev';
 
 const IngestWorkflow = workflow({
   steps: [
@@ -311,7 +311,7 @@ Honi includes a CLI for scaffolding and managing projects.
 
 ```bash
 # Install globally
-npm install -g @stukennedy/honi
+npm install -g honidev
 
 # Create a new project
 honi new my-sales-coach
@@ -446,7 +446,7 @@ Add to your Claude Desktop MCP config:
 Honi supports agent-to-agent communication for building complex agentic workflows.
 
 ```typescript
-import { routeToAgent, callAgentTool, listAgentTools } from '@stukennedy/honi';
+import { routeToAgent, callAgentTool, listAgentTools } from 'honidev';
 
 // Send a message to another agent
 const response = await routeToAgent(env, { binding: 'OTHER_AGENT' }, 'Hello!');

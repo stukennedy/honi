@@ -1,4 +1,4 @@
-import { createAgent, workflow, step, tool } from '@stukennedy/honi';
+import { createAgent, workflow, step, tool } from 'honidev';
 import { z } from 'zod';
 
 // Tools for the agent
