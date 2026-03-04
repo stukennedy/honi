@@ -2,14 +2,51 @@ import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
 import type { LanguageModel } from 'ai';
 
-export function resolveModel(modelId: string): LanguageModel {
+export interface ProviderOptions {
+  /** Worker env (for AI binding). Required for @cf/* models. */
+  env?: Record<string, unknown>;
+  /** AI Gateway base URL override for routing LLM calls through CF AI Gateway. */
+  gatewayUrl?: string;
+}
+
+export async function resolveModel(modelId: string, options?: ProviderOptions): Promise<LanguageModel> {
+  const gatewayUrl = options?.gatewayUrl;
+
   if (modelId.startsWith('claude-')) {
-    const provider = createAnthropic();
+    const providerOptions: { baseURL?: string } = {};
+    if (gatewayUrl) providerOptions.baseURL = gatewayUrl;
+    const provider = createAnthropic(providerOptions);
     return provider(modelId);
   }
+
   if (modelId.startsWith('gpt-')) {
-    const provider = createOpenAI();
+    const providerOptions: { baseURL?: string } = {};
+    if (gatewayUrl) providerOptions.baseURL = gatewayUrl;
+    const provider = createOpenAI(providerOptions);
     return provider(modelId);
   }
-  throw new Error(`Unsupported model: "${modelId}". Use a claude-* or gpt-* model ID.`);
+
+  if (modelId.startsWith('@cf/')) {
+    const ai = options?.env?.AI;
+    if (!ai) {
+      throw new Error(
+        'Workers AI requires an AI binding in your Worker env. Add [ai] binding = "AI" to wrangler.toml',
+      );
+    }
+    try {
+      // Dynamic import — @ai-sdk/cloudflare is an optional peer dependency
+      const pkg = '@ai-sdk/cloudflare';
+      const mod = await import(/* @vite-ignore */ pkg) as { createWorkersAI: (opts: { binding: unknown }) => (model: string) => LanguageModel };
+      const workersai = mod.createWorkersAI({ binding: ai });
+      return workersai(modelId);
+    } catch {
+      throw new Error(
+        'Workers AI support requires @ai-sdk/cloudflare: npm install @ai-sdk/cloudflare',
+      );
+    }
+  }
+
+  throw new Error(
+    `Unsupported model: "${modelId}". Use a claude-*, gpt-*, or @cf/* model ID.`,
+  );
 }

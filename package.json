@@ -34,5 +34,13 @@
     "@cloudflare/workers-types": "^4.20240405.0",
     "typescript": "^5.5.0"
   },
+  "peerDependencies": {
+    "@ai-sdk/cloudflare": ">=0.0.1"
+  },
+  "peerDependenciesMeta": {
+    "@ai-sdk/cloudflare": {
+      "optional": true
+    }
+  },
   "license": "MIT"
 }

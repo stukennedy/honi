@@ -37,6 +37,7 @@ export interface MemoryConfig {
 
 export interface AgentConfig {
   name: string;
+  /** Model ID. Supports claude-*, gpt-*, and @cf/* (Workers AI). Workers AI models require an AI binding in wrangler.toml. */
   model: string;
   system?: string;
   memory?: MemoryConfig;

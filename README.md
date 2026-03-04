@@ -171,19 +171,63 @@ When `memory: { enabled: true }`, conversation history is persisted in Durable O
 - `GET /history?threadId=xxx` — retrieve conversation history
 - `DELETE /history?threadId=xxx` — clear a thread's history
 
-### Multi-Provider LLM Support
+### Supported Models
 
-Honi uses the Vercel AI SDK under the hood. Model routing is automatic:
+Honi uses the Vercel AI SDK under the hood. Model routing is automatic based on the model ID prefix:
 
-| Model ID   | Provider  |
-| ---------- | --------- |
-| `claude-*` | Anthropic |
-| `gpt-*`    | OpenAI    |
+| Model prefix | Provider | Required binding / env |
+| --- | --- | --- |
+| `claude-*` | Anthropic | `ANTHROPIC_API_KEY` env var |
+| `gpt-*` | OpenAI | `OPENAI_API_KEY` env var |
+| `@cf/*` | Workers AI | `AI` binding in wrangler.toml |
 
-Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` in your Cloudflare Worker secrets:
+Set API keys as Cloudflare Worker secrets:
 
 ```bash
 wrangler secret put ANTHROPIC_API_KEY
+```
+
+#### Workers AI
+
+Use any [Workers AI model](https://developers.cloudflare.com/workers-ai/models/) by prefixing with `@cf/`:
+
+```toml
+# wrangler.toml
+[ai]
+binding = "AI"
+```
+
+```typescript
+const agent = createAgent({
+  name: 'my-agent',
+  model: '@cf/meta/llama-3.1-8b-instruct',  // Uses Workers AI
+  system: 'You are a helpful assistant.',
+});
+```
+
+Workers AI support requires the optional `@ai-sdk/cloudflare` package:
+
+```bash
+npm install @ai-sdk/cloudflare
+```
+
+#### AI Gateway
+
+Route all LLM calls through [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/) for logging, rate limiting, and caching at the edge:
+
+```typescript
+const agent = createAgent({
+  name: 'my-agent',
+  model: 'claude-sonnet-4-5',
+  observability: {
+    aiGateway: {
+      accountId: 'your-account-id',
+      gatewayId: 'your-gateway-id',
+    },
+  },
+  system: 'You are a helpful assistant.',
+});
+// All LLM calls now route through CF AI Gateway for observability
 ```
 
 ### Streaming

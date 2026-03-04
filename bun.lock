@@ -15,6 +15,12 @@
         "@cloudflare/workers-types": "^4.20240405.0",
         "typescript": "^5.5.0",
       },
+      "peerDependencies": {
+        "@ai-sdk/cloudflare": "",
+      },
+      "optionalPeers": [
+        "@ai-sdk/cloudflare",
+      ],
     },
   },
   "packages": {

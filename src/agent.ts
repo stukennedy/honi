@@ -142,7 +142,17 @@ export function createAgent(config: AgentConfig) {
         });
       }
 
-      const model = resolveModel(config.model);
+      // Resolve AI Gateway URL if configured
+      let gatewayUrl: string | undefined;
+      if (collector) {
+        if (config.model.startsWith('claude-')) {
+          gatewayUrl = collector.getAiGatewayUrl('anthropic');
+        } else if (config.model.startsWith('gpt-')) {
+          gatewayUrl = collector.getAiGatewayUrl('openai');
+        }
+      }
+
+      const model = await resolveModel(config.model, { env: this.env, gatewayUrl });
       const tools = config.tools?.length
         ? buildTools(config.tools, collector, config.name, threadId)
         : undefined;

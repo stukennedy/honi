@@ -12,6 +12,10 @@ export type {
   SemanticConfig,
 } from './types.js';
 
+// Providers
+export { resolveModel } from './providers.js';
+export type { ProviderOptions } from './providers.js';
+
 // Phase 3 — Workflows
 export { workflow, step } from './workflow.js';
 export type { WorkflowStepDef, HoniWorkflowConfig, StepConfig } from './workflow.js';
