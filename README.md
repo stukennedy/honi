@@ -506,6 +506,27 @@ Honi agents can expose their tools as MCP endpoints, allowing connection from Cl
 | `/mcp` | POST | JSON-RPC 2.0 MCP endpoint |
 | `/mcp/tools` | GET | List available tools (convenience) |
 
+### Authentication
+
+For remote connections (Cursor, custom clients, any non-local use) you should lock down `/mcp` with a Bearer token. Set `mcp.secretEnvVar` in your agent config:
+
+```typescript
+const agent = createAgent({
+  name: 'my-agent',
+  model: 'claude-sonnet-4-5',
+  tools: [searchDocs],
+  mcp: { secretEnvVar: 'MCP_SECRET' },
+})
+```
+
+Then set the secret via Wrangler:
+
+```bash
+wrangler secret put MCP_SECRET
+```
+
+Clients send `Authorization: Bearer <secret>` on every request. If `secretEnvVar` is not set, `/mcp` is unauthenticated — fine for local Claude Desktop (stdio transport), but don't expose it publicly without this.
+
 ### Example: Connect from Claude Desktop
 
 Add to your Claude Desktop MCP config:
@@ -515,6 +536,21 @@ Add to your Claude Desktop MCP config:
   "mcpServers": {
     "my-honi-agent": {
       "url": "https://my-agent.workers.dev/mcp"
+    }
+  }
+}
+```
+
+For authenticated remote connections:
+
+```json
+{
+  "mcpServers": {
+    "my-honi-agent": {
+      "url": "https://my-agent.workers.dev/mcp",
+      "headers": {
+        "Authorization": "Bearer your-secret-here"
+      }
     }
   }
 }
