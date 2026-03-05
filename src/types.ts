@@ -86,6 +86,16 @@ export interface MemoryConfig {
   graph?: GraphConfig;
 }
 
+export interface McpConfig {
+  /**
+   * Environment variable name containing the Bearer secret for remote MCP connections.
+   * Clients must send `Authorization: Bearer <secret>` on every request.
+   * If not set, /mcp is unauthenticated — fine for local Claude Desktop (stdio),
+   * but don't expose it publicly without this.
+   */
+  secretEnvVar?: string;
+}
+
 export interface AgentConfig {
   name: string;
   /** Model ID. Supports claude-*, gpt-*, and @cf/* (Workers AI). Workers AI models require an AI binding in wrangler.toml. */
@@ -99,4 +109,6 @@ export interface AgentConfig {
   maxSteps?: number;
   /** Observability configuration (event collection, AI Gateway). */
   observability?: ObservabilityConfig;
+  /** MCP server configuration. */
+  mcp?: McpConfig;
 }

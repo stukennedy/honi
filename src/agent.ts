@@ -371,6 +371,21 @@ export function createAgent(config: AgentConfig) {
 
   // MCP Server endpoint — exposes agent tools to MCP clients
   app.post('/mcp', async (c) => {
+    // Auth: check Bearer token if secretEnvVar is configured
+    if (config.mcp?.secretEnvVar) {
+      const env = c.env as Record<string, unknown>;
+      const secret = env[config.mcp.secretEnvVar] as string | undefined;
+      if (secret) {
+        const authHeader = c.req.header('Authorization') ?? '';
+        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+        if (token !== secret) {
+          return c.json({ error: 'Unauthorized' }, 401);
+        }
+      } else {
+        console.warn(`[honi] mcp.secretEnvVar "${config.mcp.secretEnvVar}" is set but env var not found — MCP endpoint is unauthenticated`);
+      }
+    }
+
     const env = c.env as Record<string, DurableObjectNamespace>;
     const ns = env[binding];
     if (!ns) {
