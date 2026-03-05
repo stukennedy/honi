@@ -4,11 +4,18 @@ import { resolveModel } from './providers.js';
 import { ThreadMemory } from './memory.js';
 import { EpisodicMemory } from './episodic.js';
 import { SemanticMemory } from './semantic.js';
+import { GraphMemory } from './graph.js';
 import { ObservabilityCollector } from './observability.js';
 import { createMcpServer } from './mcp.js';
-import type { AgentConfig, ToolDefinition } from './types.js';
+import type { AgentConfig, ToolDefinition, ToolContext } from './types.js';
 
-function buildTools(tools: ToolDefinition[], collector?: ObservabilityCollector, agentName?: string, threadId?: string) {
+function buildTools(
+  tools: ToolDefinition[],
+  ctx: ToolContext,
+  collector?: ObservabilityCollector,
+  agentName?: string,
+  threadId?: string,
+) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const result: Record<string, any> = {};
   for (const t of tools) {
@@ -26,7 +33,7 @@ function buildTools(tools: ToolDefinition[], collector?: ObservabilityCollector,
             metadata: { tool: t.name, args },
           });
           try {
-            const toolResult = await t.handler(args);
+            const toolResult = await t.handler(args, ctx);
             collector.emit({
               type: 'tool.result',
               agentName: agentName!,
@@ -49,7 +56,7 @@ function buildTools(tools: ToolDefinition[], collector?: ObservabilityCollector,
             throw err;
           }
         }
-        return t.handler(args);
+        return t.handler(args, ctx);
       },
     });
   }
@@ -70,6 +77,8 @@ export function createAgent(config: AgentConfig) {
     /** @internal */ state: DurableObjectState;
     /** @internal */ episodic: EpisodicMemory | null = null;
     /** @internal */ semantic: SemanticMemory | null = null;
+    /** Graph memory — also accessible from tool handlers via ToolContext. */
+    graph: GraphMemory | null = null;
     /** @internal */ env: Record<string, unknown>;
 
     constructor(ctx: DurableObjectState, env: unknown) {
@@ -101,6 +110,40 @@ export function createAgent(config: AgentConfig) {
         } else {
           console.warn(
             `[honi] Semantic memory enabled but bindings "${vecBinding}" and/or "${aiBinding}" not found. Falling back to DO-only memory.`,
+          );
+        }
+      }
+
+      // Initialize graph memory if configured
+      if (config.memory?.graph?.enabled) {
+        const graphCfg = config.memory.graph;
+        const apiKey = graphCfg.apiKeyEnvVar
+          ? (this.env[graphCfg.apiKeyEnvVar] as string | undefined)
+          : undefined;
+
+        if (graphCfg.binding) {
+          // Service binding: CF-internal, zero-latency
+          const fetcher = this.env[graphCfg.binding] as { fetch: (req: Request) => Promise<Response> } | undefined;
+          if (fetcher) {
+            this.graph = new GraphMemory({ graphId: graphCfg.graphId, fetcher, apiKey });
+          } else {
+            console.warn(
+              `[honi] Graph memory enabled but service binding "${graphCfg.binding}" not found.`,
+            );
+          }
+        } else if (graphCfg.urlEnvVar) {
+          // HTTP transport
+          const url = this.env[graphCfg.urlEnvVar] as string | undefined;
+          if (url) {
+            this.graph = new GraphMemory({ graphId: graphCfg.graphId, url, apiKey });
+          } else {
+            console.warn(
+              `[honi] Graph memory enabled but env var "${graphCfg.urlEnvVar}" not found.`,
+            );
+          }
+        } else {
+          console.warn(
+            '[honi] Graph memory enabled but neither "binding" nor "urlEnvVar" is configured.',
           );
         }
       }
@@ -161,8 +204,14 @@ export function createAgent(config: AgentConfig) {
       }
 
       const model = await resolveModel(config.model, { env: this.env, gatewayUrl });
+
+      // Build tool context (graph + env available to all tool handlers)
+      const toolCtx: ToolContext = {
+        graph: this.graph ?? undefined,
+        env: this.env,
+      };
       const tools = config.tools?.length
-        ? buildTools(config.tools, collector, config.name, threadId)
+        ? buildTools(config.tools, toolCtx, collector, config.name, threadId)
         : undefined;
 
       // Load history: prefer episodic (D1) if available, else DO storage
@@ -174,8 +223,11 @@ export function createAgent(config: AgentConfig) {
         history = await this.memory.load();
       }
 
-      // Semantic context: embed user message and search for relevant past context
+      // Build system prompt with layered memory context
       let systemPrompt = config.system ?? '';
+
+      // Semantic context: embed user message and search for relevant past episodes
+      let semanticEntityIds: string[] = [];
       if (this.semantic) {
         const topK = config.memory?.semantic?.topK ?? 3;
         const results = await this.semantic.search(body.message, topK);
@@ -190,6 +242,28 @@ export function createAgent(config: AgentConfig) {
             '',
           ].join('\n');
           systemPrompt = contextBlock + systemPrompt;
+
+          // Collect entity IDs from semantic result metadata for graph expansion
+          semanticEntityIds = results
+            .flatMap((r) => [r.metadata?.entityId, r.metadata?.nodeId])
+            .filter((id): id is string => typeof id === 'string');
+        }
+      }
+
+      // Graph context: expand semantic hits + any entity IDs in the user message metadata
+      // Graph context is prepended before semantic context so it appears earliest in the prompt
+      if (this.graph) {
+        const graphCfg = config.memory?.graph;
+        const maxEntities = graphCfg?.maxContextEntities ?? 5;
+        const contextDepth = graphCfg?.contextDepth ?? 1;
+
+        // Limit how many entities we expand to avoid token blowout
+        const entityIds = semanticEntityIds.slice(0, maxEntities);
+        if (entityIds.length > 0) {
+          const graphContext = await this.graph.toContext(entityIds, contextDepth);
+          if (graphContext) {
+            systemPrompt = graphContext + '\n\n' + systemPrompt;
+          }
         }
       }
 

@@ -3,13 +3,25 @@ export { tool } from './tool.js';
 export { EpisodicMemory } from './episodic.js';
 export { SemanticMemory } from './semantic.js';
 export type { SemanticResult } from './semantic.js';
+export { GraphMemory } from './graph.js';
+export type {
+  GraphNode,
+  GraphEdge,
+  TraversalResult,
+  TraversalNode,
+  PathResult,
+  SubgraphResult,
+  GraphMemoryOptions,
+} from './graph.js';
 export { z } from 'zod';
 export type {
   AgentConfig,
   ToolDefinition,
+  ToolContext,
   MemoryConfig,
   EpisodicConfig,
   SemanticConfig,
+  GraphConfig,
 } from './types.js';
 
 // Providers

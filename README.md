@@ -79,13 +79,14 @@ curl -X POST https://your-worker.workers.dev/chat \
 
 ## Memory (Phase 2)
 
-Honi supports three tiers of memory, all opt-in:
+Honi supports four tiers of memory, all opt-in:
 
 | Tier | Backing | Survives DO eviction? | Queryable across threads? |
 | --- | --- | --- | --- |
 | **Working** | Durable Object storage | No | No |
 | **Episodic** | D1 | Yes | Yes |
 | **Semantic** | Vectorize + Workers AI | Yes | Yes (similarity search) |
+| **Graph** | [edgraph](https://github.com/stukennedy/edgraph) (DO) | Yes | Yes (entity/relationship traversal) |
 
 ### Setup
 
@@ -105,6 +106,11 @@ metric = "cosine"
 
 [ai]
 binding = "AI"
+
+# Graph memory — deploy edgraph and add a service binding (or use urlEnvVar for HTTP)
+[[services]]
+binding = "EDGRAPH"
+service = "edgraph"
 ```
 
 Run the D1 migration:
@@ -120,20 +126,93 @@ const agent = createAgent({
   name: 'my-agent',
   model: 'claude-sonnet-4-5',
   memory: {
-    enabled: true,              // DO working memory
-    episodic: { enabled: true },        // D1 conversation history
-    semantic: { enabled: true, topK: 3 }, // Vectorize RAG context
+    enabled: true,
+    episodic: { enabled: true },
+    semantic: { enabled: true, topK: 3 },
+    graph: {
+      enabled: true,
+      graphId: 'my-knowledge-base',
+      binding: 'EDGRAPH',       // CF service binding (preferred)
+      // urlEnvVar: 'EDGRAPH_URL', // or HTTP URL via env var
+      apiKeyEnvVar: 'EDGRAPH_API_KEY',
+      contextDepth: 1,          // hop depth for context expansion
+    },
   },
   system: 'You are a helpful assistant.',
 });
 ```
 
-Episodic and semantic memory are fully opt-in. If the required bindings are missing, Honi logs a warning and falls back to DO-only memory.
+All tiers are fully opt-in. Missing bindings log a warning and fall back gracefully.
 
 ### How it works
 
-1. **On each request**: past messages load from D1 (episodic) and the user message is embedded and searched against Vectorize (semantic). Top-K relevant results are prepended to the system prompt.
+1. **On each request**: past messages load from D1 (episodic), the user message is embedded and searched against Vectorize (semantic), and any entity IDs found in semantic results are expanded via graph traversal. All context is prepended to the system prompt.
 2. **After each response**: the conversation turn is saved to D1 and both user + assistant messages are embedded and upserted to Vectorize for future retrieval.
+
+### Graph memory — writing entities from tools
+
+Graph memory is most powerful when tools write entities as they discover them:
+
+```typescript
+import { tool, GraphMemory } from 'honidev';
+
+const myTool = tool({
+  name: 'lookup_customer',
+  description: 'Look up a customer by ID',
+  input: z.object({ customerId: z.string() }),
+  handler: async (input, ctx) => {
+    const customer = await db.getCustomer(input.customerId);
+
+    // Write to graph — ctx.graph is the live GraphMemory instance
+    if (ctx?.graph && customer) {
+      await ctx.graph.upsertNode(customer.id, 'Customer', {
+        name: customer.name,
+        plan: customer.plan,
+      });
+      if (customer.accountManagerId) {
+        await ctx.graph.upsertEdge(
+          customer.id,
+          customer.accountManagerId,
+          'managed_by',
+        );
+      }
+    }
+
+    return customer;
+  },
+});
+```
+
+`ctx.graph` is the live `GraphMemory` instance bound to the current agent. Entities written here are immediately available for future context retrieval.
+
+### Using GraphMemory standalone
+
+`GraphMemory` can also be used outside of an agent — as a shared knowledge base across multiple services:
+
+```typescript
+import { GraphMemory } from 'honidev';
+
+const graph = new GraphMemory({
+  graphId: 'crm',
+  url: 'https://edgraph.myapp.workers.dev',
+  apiKey: process.env.EDGRAPH_API_KEY,
+});
+
+await graph.upsertNode('alice', 'Person', { role: 'CTO', company: 'ACME' });
+await graph.upsertNode('acme', 'Company', { industry: 'SaaS' });
+await graph.upsertEdge('alice', 'acme', 'works_at');
+
+// Get context block for LLM injection
+const context = await graph.toContext(['alice'], 2);
+// "[Knowledge graph context:]
+//  - (Person:alice) {role="CTO", company="ACME"}
+//    → [works_at] → (Company:acme)
+//  [End graph context]"
+
+// Traversal
+const path = await graph.shortestPath('alice', 'bob');
+const neighbours = await graph.getNeighbours('alice', 'out', ['manages']);
+```
 
 ## Core Concepts
 

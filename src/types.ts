@@ -1,11 +1,21 @@
 import type { z } from 'zod';
 import type { ObservabilityConfig } from './observability.js';
+import type { GraphMemory } from './graph.js';
+
+/** Context passed as second argument to tool handlers. */
+export interface ToolContext {
+  /** Graph memory instance — use to read/write entities from within a tool. */
+  graph?: GraphMemory;
+  /** Raw Worker env — use sparingly; prefer typed bindings. */
+  env?: Record<string, unknown>;
+}
 
 export interface ToolDefinition<T extends z.ZodType = z.ZodType> {
   name: string;
   description: string;
   input: T;
-  handler: (input: z.infer<T>) => Promise<unknown>;
+  /** Handler receives parsed input and optional context (graph, env). */
+  handler: (input: z.infer<T>, ctx?: ToolContext) => Promise<unknown>;
 }
 
 export interface EpisodicConfig {
@@ -26,6 +36,41 @@ export interface SemanticConfig {
   topK?: number;
 }
 
+export interface GraphConfig {
+  enabled: boolean;
+  /**
+   * Graph identifier — maps to one edgraph DO instance.
+   * Use a stable, descriptive name e.g. "support-knowledge-base".
+   */
+  graphId: string;
+  /**
+   * CF service binding name for zero-latency DO-to-DO calls.
+   * Requires a [[services]] entry in wrangler.jsonc pointing at your edgraph worker.
+   * Preferred over url when both agents are in the same CF account.
+   */
+  binding?: string;
+  /**
+   * Environment variable name whose value is the edgraph worker URL.
+   * Used when edgraph is in a different account or deployed externally.
+   */
+  urlEnvVar?: string;
+  /**
+   * Environment variable name whose value is the edgraph API key.
+   * Required for write operations (upsertNode, upsertEdge, deleteNode, deleteEdge).
+   */
+  apiKeyEnvVar?: string;
+  /**
+   * Depth for graph context expansion during retrieval.
+   * Higher = more context, more tokens. Defaults to 1.
+   */
+  contextDepth?: number;
+  /**
+   * Max entity IDs to expand during context generation.
+   * Guards against very large context blocks. Defaults to 5.
+   */
+  maxContextEntities?: number;
+}
+
 export interface MemoryConfig {
   /** Enable DO-based working memory. */
   enabled?: boolean;
@@ -33,6 +78,12 @@ export interface MemoryConfig {
   episodic?: EpisodicConfig;
   /** Vectorize-backed semantic memory (similarity search). */
   semantic?: SemanticConfig;
+  /**
+   * edgraph-backed graph memory (entity/relationship knowledge base).
+   * Enables structural recall: who knows who, what relates to what.
+   * Graph context is automatically injected alongside semantic results.
+   */
+  graph?: GraphConfig;
 }
 
 export interface AgentConfig {
