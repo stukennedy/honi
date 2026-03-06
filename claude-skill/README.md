@@ -7,19 +7,19 @@ Install this skill to give Claude deep knowledge of the Honi API — tools, memo
 ## Install with OpenClaw
 
 ```bash
-# Clone into your clawd skills directory
-git clone https://github.com/fluxwiseai/honi-skill ~/clawd/skills/honi
+mkdir -p ~/clawd/skills/honi
+curl -o ~/clawd/skills/honi/SKILL.md \
+  https://raw.githubusercontent.com/stukennedy/honi/main/claude-skill/SKILL.md
 ```
 
 OpenClaw will auto-discover the skill. Claude will use it whenever you ask it to build Honi agents.
 
 ## Install with Claude Code
 
-Add to your project's `CLAUDE.md` or reference it directly:
-
 ```bash
-# Copy SKILL.md into your project
-curl -o CLAUDE.md https://raw.githubusercontent.com/fluxwiseai/honi-skill/main/SKILL.md
+# Copy into your project root as CLAUDE.md
+curl -o CLAUDE.md \
+  https://raw.githubusercontent.com/stukennedy/honi/main/claude-skill/SKILL.md
 ```
 
 Or reference it from an existing `CLAUDE.md`:
@@ -27,7 +27,7 @@ Or reference it from an existing `CLAUDE.md`:
 ```markdown
 # My Project
 
-@https://raw.githubusercontent.com/fluxwiseai/honi-skill/main/SKILL.md
+@https://raw.githubusercontent.com/stukennedy/honi/main/claude-skill/SKILL.md
 ```
 
 ## What's Covered
@@ -48,3 +48,4 @@ Or reference it from an existing `CLAUDE.md`:
 - **Docs:** [honi.dev](https://honi.dev)
 - **npm:** [honidev](https://npmjs.com/package/honidev)
 - **GitHub:** [stukennedy/honi](https://github.com/stukennedy/honi)
+- **This skill:** [claude-skill/SKILL.md](https://github.com/stukennedy/honi/blob/main/claude-skill/SKILL.md)
