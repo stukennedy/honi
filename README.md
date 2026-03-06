@@ -254,16 +254,41 @@ When `memory: { enabled: true }`, conversation history is persisted in Durable O
 
 Honi uses the Vercel AI SDK under the hood. Model routing is automatic based on the model ID prefix:
 
-| Model prefix | Provider | Required binding / env |
-| --- | --- | --- |
-| `claude-*` | Anthropic | `ANTHROPIC_API_KEY` env var |
-| `gpt-*` | OpenAI | `OPENAI_API_KEY` env var |
-| `@cf/*` | Workers AI | `AI` binding in wrangler.toml |
+| Model prefix | Provider | Env var / binding | Example model |
+| --- | --- | --- | --- |
+| `claude-*` | Anthropic | `ANTHROPIC_API_KEY` | `claude-sonnet-4-5` |
+| `gpt-*`, `o1`, `o3-*` | OpenAI | `OPENAI_API_KEY` | `gpt-4o`, `o3-mini` |
+| `gemini-*` | Google | `GOOGLE_AI_API_KEY` | `gemini-2.5-flash-preview` |
+| `groq/*` | Groq | `GROQ_API_KEY` | `groq/llama-3.3-70b-versatile` |
+| `deepseek-*` | DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-chat`, `deepseek-reasoner` |
+| `mistral-*`, `codestral-*`, `pixtral-*` | Mistral | `MISTRAL_API_KEY` | `mistral-large-latest` |
+| `grok-*` | xAI | `XAI_API_KEY` | `grok-3`, `grok-3-mini` |
+| `sonar*`, `perplexity/*` | Perplexity | `PERPLEXITY_API_KEY` | `sonar-pro`, `sonar-reasoning` |
+| `together/*` | Together AI | `TOGETHER_API_KEY` | `together/meta-llama/Llama-3.3-70B-Instruct-Turbo` |
+| `command-*` | Cohere | `COHERE_API_KEY` | `command-r-plus`, `command-a-03-2025` |
+| `azure/*` | Azure OpenAI | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` | `azure/gpt-4o` |
+| `@cf/*` | Workers AI | `AI` binding in wrangler.toml | `@cf/meta/llama-3.1-8b-instruct` |
 
-Set API keys as Cloudflare Worker secrets:
+All non-core providers use optional peer dependencies — zero bundle cost unless installed. Set API keys as Cloudflare Worker secrets:
 
 ```bash
 wrangler secret put ANTHROPIC_API_KEY
+wrangler secret put GOOGLE_AI_API_KEY
+# etc.
+```
+
+Non-Anthropic/OpenAI/Google providers require their AI SDK package:
+
+```bash
+npm install @ai-sdk/groq       # Groq
+npm install @ai-sdk/deepseek   # DeepSeek
+npm install @ai-sdk/mistral    # Mistral
+npm install @ai-sdk/xai        # xAI
+npm install @ai-sdk/perplexity # Perplexity
+npm install @ai-sdk/togetherai # Together AI
+npm install @ai-sdk/cohere     # Cohere
+npm install @ai-sdk/azure      # Azure OpenAI
+npm install @ai-sdk/cloudflare # Workers AI
 ```
 
 #### Workers AI
