@@ -28,10 +28,15 @@ export class SemanticMemory {
     ]);
   }
 
-  async search(query: string, topK = 3): Promise<SemanticResult[]> {
+  async search(
+    query: string,
+    topK = 3,
+    filter?: VectorizeVectorMetadataFilter,
+  ): Promise<SemanticResult[]> {
     const values = await this.embed(query);
     const matches = await this.vectorize.query(values, {
       topK,
+      filter,
       returnMetadata: 'all',
     });
     return matches.matches
