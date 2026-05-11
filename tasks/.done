@@ -1,0 +1,9 @@
+RecursiveMemory tier — completed 2026-05-11
+
+1. [x] RecursiveConfig type added to src/types.ts (model, triggerCount, maxDepth fields)
+2. [x] RecursiveMemory class in src/recursive.ts (init, recordMessage, shouldSummarize, summarize, compress, getContext, getSummaries, clear)
+3. [x] Wired into AgentDO in src/agent.ts (constructor init, DELETE clear, context injection, REPL loop)
+4. [x] REPL loop via compress() — loads accumulated messages from episodic/working memory at depth 0, recurses upward through summary depths
+5. [x] Exported from src/index.ts (RecursiveMemory, RecursiveSummary, RecursiveConfig)
+6. [x] D1 migration added: migrations/0002_recursive.sql (honi_recursive_summaries + honi_recursive_counters)
+7. [x] Type-check clean, 25/25 tests pass

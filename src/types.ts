@@ -1,11 +1,14 @@
 import type { z } from 'zod';
 import type { ObservabilityConfig } from './observability.js';
 import type { GraphMemory } from './graph.js';
+import type { RecursiveMemory } from './recursive.js';
 
 /** Context passed as second argument to tool handlers. */
 export interface ToolContext {
   /** Graph memory instance — use to read/write entities from within a tool. */
   graph?: GraphMemory;
+  /** Recursive (RLM) memory instance — load documents and run the REPL loop. */
+  recursive?: RecursiveMemory;
   /** Raw Worker env — use sparingly; prefer typed bindings. */
   env?: Record<string, unknown>;
 }
@@ -71,6 +74,28 @@ export interface GraphConfig {
   maxContextEntities?: number;
 }
 
+export interface RecursiveConfig {
+  enabled: boolean;
+  /**
+   * Max REPL iterations (tool-call rounds) before the loop terminates.
+   * Each iteration is one LLM call. Defaults to 10.
+   * Use 5 for voice (latency-sensitive), 10-15 for email/batch.
+   */
+  maxDepth?: number;
+  /**
+   * Timeout in milliseconds for the full REPL loop.
+   * Defaults to 30000 (30s) — suitable for email.
+   * Use 5000 for voice agents.
+   */
+  timeoutMs?: number;
+  /**
+   * Character size of each document chunk stored in DO.
+   * Smaller = more granular search, more chunks.
+   * Defaults to 800.
+   */
+  chunkSize?: number;
+}
+
 export interface MemoryConfig {
   /** Enable DO-based working memory. */
   enabled?: boolean;
@@ -84,6 +109,17 @@ export interface MemoryConfig {
    * Graph context is automatically injected alongside semantic results.
    */
   graph?: GraphConfig;
+  /**
+   * Recursive memory — RLM (Recursive Language Model) tier.
+   * Documents are chunked and stored in DO storage. The model iteratively
+   * queries them via a REPL loop (search → read_chunks → reason → repeat)
+   * rather than one-shot RAG retrieval. Dramatically better at cross-references,
+   * structured data, and multi-hop reasoning.
+   *
+   * Load documents via `ctx.recursive.loadDocument(id, content)` from a tool,
+   * or call `agent.recursive.loadDocument()` from your Worker on startup.
+   */
+  recursive?: RecursiveConfig;
 }
 
 export interface McpConfig {

@@ -13,6 +13,8 @@ export type {
   SubgraphResult,
   GraphMemoryOptions,
 } from './graph.js';
+export { RecursiveMemory } from './recursive.js';
+export type { RlmResult } from './recursive.js';
 export { z } from 'zod';
 export type {
   AgentConfig,
@@ -22,6 +24,7 @@ export type {
   EpisodicConfig,
   SemanticConfig,
   GraphConfig,
+  RecursiveConfig,
 } from './types.js';
 
 // Providers

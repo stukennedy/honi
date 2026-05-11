@@ -5,6 +5,7 @@ import { ThreadMemory } from './memory.js';
 import { EpisodicMemory } from './episodic.js';
 import { SemanticMemory } from './semantic.js';
 import { GraphMemory } from './graph.js';
+import { RecursiveMemory } from './recursive.js';
 import { ObservabilityCollector } from './observability.js';
 import { createMcpServer } from './mcp.js';
 import type { AgentConfig, ToolDefinition, ToolContext } from './types.js';
@@ -79,6 +80,7 @@ export function createAgent(config: AgentConfig) {
     /** @internal */ semantic: SemanticMemory | null = null;
     /** Graph memory — also accessible from tool handlers via ToolContext. */
     graph: GraphMemory | null = null;
+    /** @internal */ recursive: RecursiveMemory | null = null;
     /** @internal */ env: Record<string, unknown>;
 
     constructor(ctx: DurableObjectState, env: unknown) {
@@ -147,6 +149,12 @@ export function createAgent(config: AgentConfig) {
           );
         }
       }
+
+      // Initialize recursive (RLM) memory if configured
+      // Uses DO storage directly — no extra binding needed.
+      if (config.memory?.recursive?.enabled) {
+        this.recursive = new RecursiveMemory(ctx.storage, config.memory.recursive);
+      }
     }
 
     async fetch(request: Request): Promise<Response> {
@@ -167,6 +175,7 @@ export function createAgent(config: AgentConfig) {
         if (this.episodic) {
           await this.episodic.clear(config.name, threadId);
         }
+        // Recursive memory uses DO storage — cleared automatically with memory.clear()
         return new Response(JSON.stringify({ ok: true }), {
           headers: { 'content-type': 'application/json' },
         });
@@ -205,9 +214,12 @@ export function createAgent(config: AgentConfig) {
 
       const model = await resolveModel(config.model, { env: this.env, gatewayUrl });
 
-      // Build tool context (graph + env available to all tool handlers)
+
+
+      // Build tool context (graph + recursive + env available to all tool handlers)
       const toolCtx: ToolContext = {
         graph: this.graph ?? undefined,
+        recursive: this.recursive ?? undefined,
         env: this.env,
       };
       const tools = config.tools?.length
@@ -247,6 +259,34 @@ export function createAgent(config: AgentConfig) {
           semanticEntityIds = results
             .flatMap((r) => [r.metadata?.entityId, r.metadata?.nodeId])
             .filter((id): id is string => typeof id === 'string');
+        }
+      }
+
+      // Recursive (RLM) memory: run the REPL loop if enabled.
+      // The loop runs before the final streamText call and injects its
+      // reasoned answer as additional context into the system prompt.
+      if (this.recursive) {
+        const recursiveCfg = config.memory?.recursive;
+        try {
+          const rlmResult = await this.recursive.runLoop(
+            body.message,
+            model,
+            systemPrompt,
+            recursiveCfg?.maxDepth,
+            recursiveCfg?.timeoutMs,
+          );
+          if (rlmResult.answer) {
+            const rlmContext = [
+              '[Document research result — ' + rlmResult.iterations + ' iterations, '
+                + rlmResult.chunksRead.length + ' chunks read:]',
+              rlmResult.answer,
+              '[End of research]',
+              '',
+            ].join('\n');
+            systemPrompt = rlmContext + systemPrompt;
+          }
+        } catch (err) {
+          console.warn('[honi] RLM loop failed — falling back to direct response:', (err as Error).message);
         }
       }
 
@@ -323,6 +363,9 @@ export function createAgent(config: AgentConfig) {
               }
             }
           }
+
+          // Recursive memory stores its documents in DO storage;
+          // no per-turn bookkeeping needed in onFinish.
         },
       });
 
