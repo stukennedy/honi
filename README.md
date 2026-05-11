@@ -609,3 +609,106 @@ class_name = "MyAgentDO"
 name = "OTHER_AGENT"
 class_name = "OtherAgentDO"
 ```
+
+---
+
+## Recursive Memory — RLM tier (Phase 6)
+
+Recursive memory implements the **Recursive Language Model** pattern from Zhang, Kraska & Khattab (MIT CSAIL, 2025). Instead of one-shot RAG retrieval, the model iteratively queries a document store — deciding what to read at each step based on what it has already learned.
+
+| Tier | Backing | Survives DO eviction? | Use case |
+| --- | --- | --- | --- |
+| **Recursive** | Durable Object storage | No (session-scoped) | Structured KB, support docs, product manuals |
+
+### How it differs from Semantic (RAG)
+
+| | Semantic (RAG) | Recursive (RLM) |
+|---|---|---|
+| Retrieval | Embedding similarity — a *guess* before reasoning | Model decides what to read *during* reasoning |
+| Cross-references | Misses joins — top-k doesn't follow links | Iterative — reads lead to further reads |
+| Structured data | Flattens tables/matrices into embeddings | Queries structure directly |
+| Token cost | One large context per call | Many small calls — reads only what's needed |
+| Best for | Unstructured text, past conversations | Product docs, error codes, KB articles, version matrices |
+
+### Configure
+
+No extra bindings needed — recursive memory uses the agent's existing Durable Object storage.
+
+```typescript
+const agent = createAgent({
+  name: 'support-agent',
+  model: 'claude-sonnet-4-5',
+  memory: {
+    recursive: {
+      enabled: true,
+      maxDepth: 10,      // max REPL iterations (default: 10)
+      timeoutMs: 30_000, // loop timeout in ms (default: 30s)
+      chunkSize: 800,    // chars per chunk (default: 800)
+    },
+  },
+});
+```
+
+For voice agents where latency is critical:
+
+```typescript
+memory: {
+  recursive: { enabled: true, maxDepth: 5, timeoutMs: 5_000 },
+}
+```
+
+### Loading documents
+
+Load KB documents from a tool, a Worker startup handler, or a DO alarm:
+
+```typescript
+const loadKb = tool({
+  name: 'load_kb',
+  description: 'Load a KB article into the document store',
+  input: z.object({ id: z.string(), content: z.string(), title: z.string().optional() }),
+  handler: async ({ id, content, title }, ctx) => {
+    await ctx.recursive!.loadDocument(id, content, title);
+    return { ok: true };
+  },
+});
+```
+
+Or directly on agent startup:
+
+```typescript
+// In your Worker fetch handler, before routing to the agent:
+const agentId = env.AGENT.idFromName('support');
+const agentStub = env.AGENT.get(agentId);
+
+// Call a custom /load-kb route on the AgentDO (add it in a subclass)
+await agentStub.fetch(new Request('https://do/load-kb', {
+  method: 'POST',
+  body: JSON.stringify({ id: 'bridge-upgrade', content: kbArticle }),
+}));
+```
+
+### How the loop works
+
+1. User message arrives.
+2. `runLoop()` fires before `streamText` — the model calls `search()`, `read_chunks()`, and `get_index()` iteratively via `generateText` with `maxSteps`.
+3. Each tool call executes against DO storage — sub-millisecond, no network hop.
+4. When the model returns text instead of a tool call, the loop ends.
+5. The research result is injected into the system prompt.
+6. `streamText` produces the final streamed response to the client using the enriched context.
+
+### RecursiveMemory API
+
+For direct use outside `createAgent()`:
+
+```typescript
+import { RecursiveMemory } from 'honidev';
+
+const mem = new RecursiveMemory(doStorage, { enabled: true, chunkSize: 800 });
+
+await mem.loadDocument('doc-id', content, 'Optional Title');
+const hits = await mem.search('activation error arm mac');
+const chunks = await mem.readChunks([0, 1, 2]);
+const index = await mem.getIndex();
+const result = await mem.runLoop(userMessage, model, systemPrompt);
+// result: { answer: string, iterations: number, chunksRead: number[] }
+```
