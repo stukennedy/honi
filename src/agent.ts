@@ -202,19 +202,10 @@ export function createAgent(config: AgentConfig) {
         });
       }
 
-      // Resolve AI Gateway URL if configured
-      let gatewayUrl: string | undefined;
-      if (collector) {
-        if (config.model.startsWith('claude-')) {
-          gatewayUrl = collector.getAiGatewayUrl('anthropic');
-        } else if (config.model.startsWith('gpt-')) {
-          gatewayUrl = collector.getAiGatewayUrl('openai');
-        }
-      }
-
-      const model = await resolveModel(config.model, { env: this.env, gatewayUrl });
-
-
+      // Route through Cloudflare AI Gateway if configured.
+      // Top-level aiGateway wins over the legacy observability.aiGateway shape.
+      const gateway = config.aiGateway ?? config.observability?.aiGateway;
+      const model = await resolveModel(config.model, { env: this.env, gateway });
 
       // Build tool context (graph + recursive + env available to all tool handlers)
       const toolCtx: ToolContext = {

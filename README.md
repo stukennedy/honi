@@ -269,7 +269,7 @@ Honi uses the Vercel AI SDK under the hood. Model routing is automatic based on 
 | `azure/*` | Azure OpenAI | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` | `azure/gpt-4o` |
 | `@cf/*` | Workers AI | `AI` binding in wrangler.toml | `@cf/meta/llama-3.1-8b-instruct` |
 
-All non-core providers use optional peer dependencies — zero bundle cost unless installed. Set API keys as Cloudflare Worker secrets:
+Workers AI (`@cf/*`) and AI Gateway support are built in — no extra packages, and no API keys needed (see below). Other non-core providers use optional peer dependencies — zero bundle cost unless installed. Set API keys as Cloudflare Worker secrets:
 
 ```bash
 wrangler secret put ANTHROPIC_API_KEY
@@ -288,12 +288,11 @@ npm install @ai-sdk/perplexity # Perplexity
 npm install @ai-sdk/togetherai # Together AI
 npm install @ai-sdk/cohere     # Cohere
 npm install @ai-sdk/azure      # Azure OpenAI
-npm install @ai-sdk/cloudflare # Workers AI
 ```
 
-#### Workers AI
+#### Workers AI — no API key needed
 
-Use any [Workers AI model](https://developers.cloudflare.com/workers-ai/models/) by prefixing with `@cf/`:
+Use any [Workers AI model](https://developers.cloudflare.com/workers-ai/models/) by prefixing with `@cf/`. Inference runs on your Cloudflare account via the `AI` binding — no API key, no extra packages:
 
 ```toml
 # wrangler.toml
@@ -304,35 +303,45 @@ binding = "AI"
 ```typescript
 const agent = createAgent({
   name: 'my-agent',
-  model: '@cf/meta/llama-3.1-8b-instruct',  // Uses Workers AI
+  model: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',  // Uses Workers AI
   system: 'You are a helpful assistant.',
 });
 ```
 
-Workers AI support requires the optional `@ai-sdk/cloudflare` package:
+#### AI Gateway — hosted models without BYOK
 
-```bash
-npm install @ai-sdk/cloudflare
-```
-
-#### AI Gateway
-
-Route all LLM calls through [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/) for logging, rate limiting, and caching at the edge:
+Route all LLM calls through [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/) for logging, rate limiting, and caching at the edge. When your gateway holds provider credentials — via [BYOK stored keys](https://developers.cloudflare.com/ai-gateway/configuration/bring-your-own-keys/) or [Unified Billing](https://developers.cloudflare.com/ai-gateway/features/unified-billing/) — your Worker needs **no provider API keys at all**:
 
 ```typescript
 const agent = createAgent({
   name: 'my-agent',
   model: 'claude-sonnet-4-5',
-  observability: {
-    aiGateway: {
-      accountId: 'your-account-id',
-      gatewayId: 'your-gateway-id',
-    },
+  aiGateway: {
+    gatewayId: 'your-gateway-id',
   },
   system: 'You are a helpful assistant.',
 });
-// All LLM calls now route through CF AI Gateway for observability
+// All LLM calls route through your AI Gateway. With the AI binding
+// ([ai] binding = "AI" in wrangler.toml) authentication is automatic —
+// no account ID, no tokens, no provider keys.
 ```
+
+Gateway authentication resolves in this order:
+
+1. **AI binding** (recommended): with `[ai] binding = "AI"` in `wrangler.toml`, Honi calls the gateway through `env.AI.gateway()` — fully keyless from the Worker.
+2. **Gateway token**: without the binding, set `accountId` and store an [AI Gateway token](https://developers.cloudflare.com/ai-gateway/configuration/authentication/) as a secret (`wrangler secret put CF_AIG_TOKEN`). Honi sends it as `cf-aig-authorization`:
+
+```typescript
+aiGateway: {
+  accountId: 'your-account-id',
+  gatewayId: 'your-gateway-id',
+  tokenEnvVar: 'CF_AIG_TOKEN', // default
+},
+```
+
+Provider API keys set in the Worker still work and are passed through — the gateway's stored keys simply take precedence when configured. Gateway routing covers Anthropic, OpenAI, Google, Groq, DeepSeek, Mistral, xAI, Perplexity, and Azure OpenAI; Together AI and Cohere always connect directly. Workers AI models (`@cf/*`) log through the gateway natively via the binding.
+
+The legacy `observability.aiGateway` config is still honored, but prefer top-level `aiGateway`.
 
 ### Streaming
 
@@ -445,10 +454,6 @@ const agent = createAgent({
       // Send to your logging/analytics service
       console.log(event.type, event.durationMs);
     },
-    aiGateway: {
-      accountId: 'your-cf-account-id',
-      gatewayId: 'your-gateway-id',
-    },
   },
 });
 ```
@@ -470,7 +475,7 @@ const agent = createAgent({
 
 ### AI Gateway
 
-Set `observability.aiGateway` to route LLM calls through [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/) for logging, rate limiting, and caching at the edge.
+Set top-level `aiGateway` to route LLM calls through [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/) for logging, rate limiting, and caching at the edge — see [AI Gateway — hosted models without BYOK](#ai-gateway--hosted-models-without-byok). The legacy `observability.aiGateway` shape is still honored.
 
 ## API Reference
 
@@ -485,6 +490,7 @@ Set `observability.aiGateway` to route LLM calls through [Cloudflare AI Gateway]
 | `tools`    | `ToolDefinition[]`    | `[]`              | Agent tools                                |
 | `binding`  | `string`              | `"AGENT"`         | Durable Object binding name                |
 | `maxSteps` | `number`              | `10`              | Max tool-calling loop iterations           |
+| `aiGateway` | `AiGatewayConfig`    | —                 | Route LLM calls through CF AI Gateway      |
 
 Returns `{ fetch, DurableObject }`.
 

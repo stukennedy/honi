@@ -29,7 +29,7 @@ export type {
 
 // Providers
 export { resolveModel } from './providers.js';
-export type { ProviderOptions } from './providers.js';
+export type { ProviderOptions, AiGatewayConfig } from './providers.js';
 
 // Phase 3 — Workflows
 export { workflow, step } from './workflow.js';
