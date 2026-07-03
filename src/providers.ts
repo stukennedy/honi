@@ -102,7 +102,7 @@ function resolveApiKey(
 ): string | undefined {
   const key = env[envVar] as string | undefined;
   if (key) return key;
-  return gateway ? 'CF_AIG_STORED_KEY' : undefined;
+  return gateway ? 'CF_TEMP_TOKEN' : undefined;
 }
 
 export async function resolveModel(modelId: string, options?: ProviderOptions): Promise<LanguageModel> {
