@@ -1,8 +1,8 @@
+import type { AiGatewayConfig } from './providers.js';
+
 export interface ObservabilityConfig {
-  aiGateway?: {
-    accountId: string;
-    gatewayId: string;
-  };
+  /** @deprecated Set `aiGateway` at the top level of `createAgent()` config instead. */
+  aiGateway?: AiGatewayConfig & { accountId: string };
   logLevel?: 'none' | 'error' | 'warn' | 'info' | 'debug';
   onEvent?: (event: HoniEvent) => void;
 }
@@ -50,7 +50,7 @@ export class ObservabilityCollector {
     this.events = [];
   }
 
-  // Get AI Gateway base URL for routing LLM calls through CF AI Gateway
+  /** @deprecated Gateway routing now happens in resolveModel() via the `gateway` option. */
   getAiGatewayUrl(provider: 'anthropic' | 'openai'): string | undefined {
     if (!this.config.aiGateway) return undefined;
     const { accountId, gatewayId } = this.config.aiGateway;

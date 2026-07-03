@@ -1,5 +1,6 @@
 import type { z } from 'zod';
 import type { ObservabilityConfig } from './observability.js';
+import type { AiGatewayConfig } from './providers.js';
 import type { GraphMemory } from './graph.js';
 import type { RecursiveMemory } from './recursive.js';
 
@@ -134,7 +135,10 @@ export interface McpConfig {
 
 export interface AgentConfig {
   name: string;
-  /** Model ID. Supports claude-*, gpt-*, and @cf/* (Workers AI). Workers AI models require an AI binding in wrangler.toml. */
+  /**
+   * Model ID. Supports claude-*, gpt-*, gemini-*, @cf/* (Workers AI), and more.
+   * Workers AI models run on the AI binding in wrangler.toml — no API key needed.
+   */
   model: string;
   system?: string;
   memory?: MemoryConfig;
@@ -143,6 +147,13 @@ export interface AgentConfig {
   binding?: string;
   /** Max tool-call loop iterations. Defaults to 10. */
   maxSteps?: number;
+  /**
+   * Route all LLM calls through Cloudflare AI Gateway.
+   * With BYOK keys stored in the gateway (or Unified Billing), no provider
+   * API keys are needed in the Worker. Authenticates via the AI binding when
+   * available, else via a `cf-aig-authorization` token.
+   */
+  aiGateway?: AiGatewayConfig;
   /** Observability configuration (event collection, AI Gateway). */
   observability?: ObservabilityConfig;
   /** MCP server configuration. */

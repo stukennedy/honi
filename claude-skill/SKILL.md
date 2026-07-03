@@ -67,6 +67,7 @@ createAgent({
   maxSteps?: number,             // Tool loop limit (default: 10)
   memory?: MemoryConfig,         // Memory tier config (see Memory section)
   mcp?: McpConfig,               // MCP server config (see MCP section)
+  aiGateway?: AiGatewayConfig,   // Route LLM calls through CF AI Gateway (see AI Gateway section)
   observability?: ObservabilityConfig,
 })
 ```
@@ -298,7 +299,7 @@ wrangler secret put MCP_SECRET
 | `command-*` | Cohere | `command-r-plus` |
 | `@cf/*` | Workers AI | `@cf/meta/llama-3.1-8b-instruct` |
 
-Workers AI models require an `[ai]` binding in `wrangler.toml`. All other providers use their respective API key set via `wrangler secret`.
+Workers AI models require an `[ai]` binding in `wrangler.toml` — no API key needed. Other providers use their respective API key set via `wrangler secret`, OR no key at all when routed through AI Gateway with stored keys / Unified Billing (see AI Gateway section).
 
 **Environment variable names:**
 - Anthropic: `ANTHROPIC_API_KEY`
@@ -312,15 +313,31 @@ Workers AI models require an `[ai]` binding in `wrangler.toml`. All other provid
 - Together: `TOGETHER_API_KEY`
 - Cohere: `COHERE_API_KEY`
 
+## AI Gateway
+
+Route all LLM calls through Cloudflare AI Gateway. With BYOK keys stored in the gateway (or Unified Billing), the Worker needs no provider API keys:
+
+```typescript
+createAgent({
+  // ...
+  aiGateway: {
+    gatewayId: 'my-gateway',       // Gateway ID (slug) from the CF dashboard
+    accountId: 'cf-account-id',    // Only needed without an [ai] binding
+    tokenEnvVar: 'CF_AIG_TOKEN',   // Gateway auth token env var (default)
+  }
+})
+```
+
+With an `[ai]` binding in `wrangler.toml`, only `gatewayId` is required — auth happens through the binding, fully keyless. Gateway routing covers Anthropic, OpenAI, Google, Groq, DeepSeek, Mistral, xAI, Perplexity, and Azure OpenAI. `@cf/*` models route through the gateway natively.
+
 ## Observability
 
 ```typescript
 createAgent({
   // ...
   observability: {
-    enabled: true,
-    aiGatewaySlug: 'my-gateway',  // Cloudflare AI Gateway slug
-    collectEvents: true,           // Log tool calls + responses
+    logLevel: 'debug',                    // none | error | warn | info | debug
+    onEvent: (event) => console.log(event), // Structured event callback
   }
 })
 ```
