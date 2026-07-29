@@ -257,6 +257,7 @@ Honi uses the Vercel AI SDK under the hood. Model routing is automatic based on 
 | Model prefix | Provider | Env var / binding | Example model |
 | --- | --- | --- | --- |
 | `claude-*` | Anthropic | `ANTHROPIC_API_KEY` | `claude-sonnet-4-5` |
+| `bedrock/*` | AWS Bedrock (Anthropic models) | `AWS_BEARER_TOKEN_BEDROCK` + `AWS_BEDROCK_REGION` | `bedrock/anthropic.claude-haiku-4-5` |
 | `gpt-*`, `o1`, `o3-*` | OpenAI | `OPENAI_API_KEY` | `gpt-4o`, `o3-mini` |
 | `gemini-*` | Google | `GOOGLE_AI_API_KEY` | `gemini-2.5-flash-preview` |
 | `groq/*` | Groq | `GROQ_API_KEY` | `groq/llama-3.3-70b-versatile` |
@@ -342,6 +343,49 @@ aiGateway: {
 Provider API keys set in the Worker still work and are passed through — the gateway's stored keys simply take precedence when configured. Gateway routing covers Anthropic, OpenAI, Google, Groq, DeepSeek, Mistral, xAI, Perplexity, and Azure OpenAI; Together AI and Cohere always connect directly. Workers AI models (`@cf/*`) log through the gateway natively via the binding.
 
 The legacy `observability.aiGateway` config is still honored, but prefer top-level `aiGateway`.
+
+#### AWS Bedrock — Claude on AWS infrastructure
+
+Run Anthropic models on AWS-operated serving infrastructure with the `bedrock/` prefix. Honi targets Bedrock's [mantle endpoint](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html), which speaks the Anthropic Messages API natively with plain bearer-token auth — no SigV4 signing and no AWS SDK in your Worker:
+
+```typescript
+const agent = createAgent({
+  name: 'my-agent',
+  model: 'bedrock/anthropic.claude-haiku-4-5',  // Bedrock's vendor-prefixed model id
+  system: 'You are a helpful assistant.',
+});
+```
+
+```bash
+wrangler secret put AWS_BEARER_TOKEN_BEDROCK   # a long-term Amazon Bedrock API key
+wrangler secret put AWS_BEDROCK_REGION         # e.g. eu-west-1
+```
+
+Notes:
+
+- The model id after `bedrock/` is passed to Bedrock **verbatim** and uses Bedrock's naming (`anthropic.claude-haiku-4-5`), not Anthropic's.
+- **Pick the region deliberately** — it decides where prompts are processed. If you have data-residency requirements, choose a region (and account-level inference profile) that guarantees them.
+- Bedrock is an independent failure domain from `api.anthropic.com` running the same models, which makes a `claude-*` ⇄ `bedrock/*` pair a natural primary/failover setup.
+- `bedrock/*` cannot be combined with `aiGateway` — the gateway's Bedrock support uses its own endpoint scheme. Honi throws rather than silently going direct.
+
+#### Gateway request options — caching, retries, privacy
+
+`aiGateway.options` passes [per-request gateway options](https://developers.cloudflare.com/ai-gateway/configuration/request-handling/) through to Cloudflare (they become `cf-aig-*` headers), on both the binding and token auth paths:
+
+```typescript
+aiGateway: {
+  gatewayId: 'your-gateway-id',
+  options: {
+    collectLog: false,                    // don't store prompt/response bodies in gateway logs
+    metadata: { app: 'my-app' },          // filterable in gateway analytics (max 5 keys)
+    cacheTtl: 3600,
+    retries: { maxAttempts: 3, backoff: 'exponential' },
+    requestTimeoutMs: 30_000,
+  },
+},
+```
+
+> **Privacy note:** the gateway stores full request *and response* bodies by default, and there is no gateway-level setting to turn that off. If your prompts carry user data, set `collectLog: false` — token counts, model, cost and latency are still logged; the payloads are not.
 
 ### Streaming
 
@@ -463,7 +507,7 @@ const agent = createAgent({
 | Event | Emitted When |
 | --- | --- |
 | `agent.request` | Incoming chat request |
-| `agent.response` | Response stream complete |
+| `agent.response` | Response stream complete — `metadata` carries `model`, `usage`, `finishReason`, `providerMetadata` |
 | `tool.call` | Tool execution starts |
 | `tool.result` | Tool execution finishes |
 | `memory.load` | Memory loaded from storage |
@@ -472,6 +516,24 @@ const agent = createAgent({
 | `workflow.step` | Workflow step executes |
 | `workflow.complete` | Workflow finishes |
 | `workflow.error` | Workflow errors |
+
+### Token usage & cost telemetry
+
+`agent.response` includes token counts in `metadata`, so consumers can attribute LLM spend per call without proxying anything:
+
+```typescript
+observability: {
+  onEvent: (event) => {
+    if (event.type === 'agent.response') {
+      const { model, usage, providerMetadata } = event.metadata ?? {};
+      // usage: { promptTokens, completionTokens, totalTokens }
+      // providerMetadata.anthropic: cacheCreationInputTokens / cacheReadInputTokens
+      // (the prompt-cache buckets, billed at different rates to fresh input)
+      recordSpend(model, usage, providerMetadata);
+    }
+  },
+},
+```
 
 ### AI Gateway
 

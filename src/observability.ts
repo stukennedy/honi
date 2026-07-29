@@ -50,11 +50,18 @@ export class ObservabilityCollector {
     this.events = [];
   }
 
-  /** @deprecated Gateway routing now happens in resolveModel() via the `gateway` option. */
+  /**
+   * @deprecated Gateway routing now happens in resolveModel() via the `gateway` option.
+   *
+   * Note the trailing `/v1`: this URL's one historical use was as an AI SDK
+   * `baseURL`, and both the Anthropic and OpenAI providers treat baseURL as
+   * already containing the version segment (they append only `/messages` /
+   * `/chat/completions`). Without it, every request 404s at the gateway.
+   */
   getAiGatewayUrl(provider: 'anthropic' | 'openai'): string | undefined {
     if (!this.config.aiGateway) return undefined;
     const { accountId, gatewayId } = this.config.aiGateway;
-    return `https://gateway.ai.cloudflare.com/v1/${accountId}/${gatewayId}/${provider}`;
+    return `https://gateway.ai.cloudflare.com/v1/${accountId}/${gatewayId}/${provider}/v1`;
   }
 }
 

@@ -94,8 +94,10 @@ describe('getAiGatewayUrl()', () => {
     const collector = new ObservabilityCollector({
       aiGateway: { accountId: 'acc123', gatewayId: 'gw456' },
     });
+    // Trailing /v1 is load-bearing: this URL's use is as an AI SDK baseURL,
+    // and the providers append only /messages — without /v1 every call 404s.
     expect(collector.getAiGatewayUrl('anthropic')).toBe(
-      'https://gateway.ai.cloudflare.com/v1/acc123/gw456/anthropic',
+      'https://gateway.ai.cloudflare.com/v1/acc123/gw456/anthropic/v1',
     );
   });
 
@@ -104,7 +106,7 @@ describe('getAiGatewayUrl()', () => {
       aiGateway: { accountId: 'acc123', gatewayId: 'gw456' },
     });
     expect(collector.getAiGatewayUrl('openai')).toBe(
-      'https://gateway.ai.cloudflare.com/v1/acc123/gw456/openai',
+      'https://gateway.ai.cloudflare.com/v1/acc123/gw456/openai/v1',
     );
   });
 });

@@ -90,3 +90,157 @@ describe('resolveModel — errors', () => {
     await expect(resolveModel('not-a-model', {})).rejects.toThrow(/Unsupported model/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Wire-level helpers: stub fetch and capture what the provider actually sends.
+// Asserting the request URL (not the config we passed in) is deliberate — the
+// AI SDK treats baseURL as already containing the version segment, and a URL
+// assembled one path segment wrong 404s in production while every config-level
+// assertion stays green.
+// ---------------------------------------------------------------------------
+
+interface CapturedRequest {
+  url: string;
+  headers: Record<string, string>;
+}
+
+/** Minimal valid Anthropic Messages API response. */
+function anthropicResponse(): Response {
+  return new Response(
+    JSON.stringify({
+      id: 'msg_test',
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'ok' }],
+      model: 'test',
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 1, output_tokens: 1 },
+    }),
+    { headers: { 'content-type': 'application/json' } },
+  );
+}
+
+async function captureWireRequest(
+  model: Awaited<ReturnType<typeof resolveModel>>,
+): Promise<CapturedRequest> {
+  const captured: CapturedRequest[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const headers: Record<string, string> = {};
+    new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined)).forEach(
+      (v, k) => {
+        headers[k] = v;
+      },
+    );
+    captured.push({ url, headers });
+    return anthropicResponse();
+  }) as typeof fetch;
+  try {
+    await model.doGenerate({
+      inputFormat: 'prompt',
+      mode: { type: 'regular' },
+      prompt: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  if (captured.length !== 1) throw new Error(`expected 1 request, saw ${captured.length}`);
+  return captured[0];
+}
+
+describe('resolveModel — AWS Bedrock (bedrock/*)', () => {
+  const bedrockEnv = {
+    AWS_BEDROCK_REGION: 'eu-west-1',
+    AWS_BEARER_TOKEN_BEDROCK: 'bedrock-key-123',
+  };
+
+  it('sends the request to the mantle Messages endpoint, /v1 included', async () => {
+    const model = await resolveModel('bedrock/anthropic.claude-haiku-4-5', { env: bedrockEnv });
+    const req = await captureWireRequest(model);
+    // The full wire URL — a baseURL missing /v1 yields .../anthropic/messages,
+    // which passes config-level assertions and 404s live.
+    expect(req.url).toBe('https://bedrock-mantle.eu-west-1.api.aws/anthropic/v1/messages');
+  });
+
+  it('authenticates with an Authorization bearer header', async () => {
+    const model = await resolveModel('bedrock/anthropic.claude-haiku-4-5', { env: bedrockEnv });
+    const req = await captureWireRequest(model);
+    expect(req.headers['authorization']).toBe('Bearer bedrock-key-123');
+  });
+
+  it("passes Bedrock's vendor-prefixed model id through verbatim", async () => {
+    const model = await resolveModel('bedrock/anthropic.claude-haiku-4-5', { env: bedrockEnv });
+    expect(model.modelId).toBe('anthropic.claude-haiku-4-5');
+  });
+
+  it('merges caller headers on top of the auth header', async () => {
+    const model = await resolveModel('bedrock/anthropic.claude-haiku-4-5', {
+      env: bedrockEnv,
+      headers: { 'x-trace-id': 'trace-1' },
+    });
+    const req = await captureWireRequest(model);
+    expect(req.headers['x-trace-id']).toBe('trace-1');
+    expect(req.headers['authorization']).toBe('Bearer bedrock-key-123');
+  });
+
+  it('fails loudly without a region — region choice is a residency decision', async () => {
+    await expect(
+      resolveModel('bedrock/anthropic.claude-haiku-4-5', {
+        env: { AWS_BEARER_TOKEN_BEDROCK: 'k' },
+      }),
+    ).rejects.toThrow(/AWS_BEDROCK_REGION/);
+  });
+
+  it('fails loudly without a bearer token', async () => {
+    await expect(
+      resolveModel('bedrock/anthropic.claude-haiku-4-5', {
+        env: { AWS_BEDROCK_REGION: 'eu-west-1' },
+      }),
+    ).rejects.toThrow(/AWS_BEARER_TOKEN_BEDROCK/);
+  });
+
+  it('refuses AI Gateway routing rather than silently going direct', async () => {
+    await expect(
+      resolveModel('bedrock/anthropic.claude-haiku-4-5', {
+        env: bedrockEnv,
+        gateway: gatewayConfig,
+      }),
+    ).rejects.toThrow(/cannot be routed through AI Gateway/);
+  });
+});
+
+describe('resolveModel — provider headers (direct route)', () => {
+  it('sends caller headers on a direct claude-* request', async () => {
+    const model = await resolveModel('claude-sonnet-4-5', {
+      env: { ANTHROPIC_API_KEY: 'sk-test' },
+      headers: { 'x-custom': 'yes' },
+    });
+    const req = await captureWireRequest(model);
+    expect(req.headers['x-custom']).toBe('yes');
+    expect(req.url).toBe('https://api.anthropic.com/v1/messages');
+  });
+});
+
+describe('resolveModel — AI Gateway request options', () => {
+  it('passes options (collectLog, metadata) through to the gateway wrapper', async () => {
+    const model = (await resolveModel('claude-sonnet-4-5', {
+      env: { CF_AIG_TOKEN: 'secret' },
+      gateway: {
+        ...gatewayConfig,
+        options: { collectLog: false, metadata: { app: 'test' } },
+      },
+    })) as AiGatewayChatLanguageModel;
+    expect(model).toBeInstanceOf(AiGatewayChatLanguageModel);
+    expect(model.config.options?.collectLog).toBe(false);
+    expect(model.config.options?.metadata).toEqual({ app: 'test' });
+  });
+
+  it('passes options on the keyless binding path too', async () => {
+    const model = (await resolveModel('claude-sonnet-4-5', {
+      env: { AI: mockAiBinding() },
+      gateway: { gatewayId: 'gw456', options: { collectLog: false } },
+    })) as AiGatewayChatLanguageModel;
+    expect(model.config.options?.collectLog).toBe(false);
+  });
+});

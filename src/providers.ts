@@ -2,7 +2,7 @@ import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { createWorkersAI } from 'workers-ai-provider';
-import { createAiGateway } from 'ai-gateway-provider';
+import { createAiGateway, type AiGatewayOptions } from 'ai-gateway-provider';
 import type { LanguageModel } from 'ai';
 
 /**
@@ -28,6 +28,18 @@ export interface AiGatewayConfig {
   tokenEnvVar?: string;
   /** Workers AI binding name (also used for keyless gateway auth). Defaults to "AI". */
   binding?: string;
+  /**
+   * Per-request gateway options, passed straight through to the gateway
+   * (`cf-aig-*` headers): caching, retries, timeouts, `metadata` for log
+   * filtering, and `collectLog`.
+   *
+   * Privacy note: the gateway stores full request AND response bodies by
+   * default (`collectLog` defaults to true server-side, and there is no
+   * gateway-level setting to turn it off). If prompts carry user data, set
+   * `collectLog: false` — token counts, model, cost and latency are still
+   * logged; the payloads are not.
+   */
+  options?: AiGatewayOptions;
 }
 
 export interface ProviderOptions {
@@ -43,6 +55,13 @@ export interface ProviderOptions {
    * claude-*, gpt-*, and gemini-* models only.
    */
   gatewayUrl?: string;
+  /**
+   * Extra headers sent on every request to the provider. Applied to the
+   * claude-*, gpt-*, gemini-* and bedrock/* factories (the AI SDK providers
+   * that accept a `headers` option). Useful for proxy auth or observability
+   * headers on a direct (non-gateway) route.
+   */
+  headers?: Record<string, string>;
 }
 
 // Minimal shape of the Workers AI binding's gateway accessor.
@@ -74,7 +93,10 @@ function wrapWithGateway(
 ): LanguageModel {
   const binding = env[gateway.binding ?? 'AI'] as AiBindingWithGateway | undefined;
   if (binding && typeof binding.gateway === 'function') {
-    return createAiGateway({ binding: binding.gateway(gateway.gatewayId) })(model);
+    return createAiGateway({
+      binding: binding.gateway(gateway.gatewayId),
+      ...(gateway.options ? { options: gateway.options } : {}),
+    })(model);
   }
   if (!gateway.accountId) {
     throw new Error(
@@ -86,6 +108,7 @@ function wrapWithGateway(
     accountId: gateway.accountId,
     gateway: gateway.gatewayId,
     ...(token ? { apiKey: token } : {}),
+    ...(gateway.options ? { options: gateway.options } : {}),
   })(model);
 }
 
@@ -108,6 +131,7 @@ function resolveApiKey(
 export async function resolveModel(modelId: string, options?: ProviderOptions): Promise<LanguageModel> {
   const gatewayUrl = options?.gatewayUrl;
   const gateway = options?.gateway;
+  const headers = options?.headers;
   const env = options?.env ?? {};
   const viaGateway = (model: LanguageModel): LanguageModel =>
     gateway ? wrapWithGateway(model, gateway, env) : model;
@@ -116,19 +140,70 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   // Models: claude-opus-4-5, claude-sonnet-4-5, claude-haiku-3-5, etc.
   // Env:    ANTHROPIC_API_KEY (optional with AI Gateway stored keys)
   if (modelId.startsWith('claude-')) {
-    const opts: { baseURL?: string; apiKey?: string } = {};
+    const opts: { baseURL?: string; apiKey?: string; headers?: Record<string, string> } = {};
     if (gatewayUrl) opts.baseURL = gatewayUrl;
+    if (headers) opts.headers = headers;
     const apiKey = resolveApiKey(env, 'ANTHROPIC_API_KEY', gateway);
     if (apiKey) opts.apiKey = apiKey;
     return viaGateway(createAnthropic(opts)(modelId));
+  }
+
+  // ── AWS Bedrock (Anthropic models via the bedrock-mantle endpoint) ────────
+  // Models: bedrock/anthropic.claude-haiku-4-5, bedrock/anthropic.claude-sonnet-4-5, etc.
+  // Env:    AWS_BEARER_TOKEN_BEDROCK (a long-term Bedrock API key), AWS_BEDROCK_REGION
+  //
+  // The mantle endpoint speaks the Anthropic Messages API natively
+  // (https://bedrock-mantle.{region}.api.aws/anthropic/v1/messages) with plain
+  // bearer-token auth — no SigV4, no AWS SDK. So this is the standard Anthropic
+  // provider pointed at AWS-operated serving infrastructure: an independent
+  // failure domain from api.anthropic.com running the same models.
+  //
+  // The model id after the prefix is passed to Bedrock verbatim and uses
+  // Bedrock's naming (vendor-prefixed, e.g. `anthropic.claude-haiku-4-5`), not
+  // Anthropic's. Region choice is a data-residency decision: a request only
+  // stays in-region if the region (and any inference profile the account maps
+  // it to) says so.
+  if (modelId.startsWith('bedrock/')) {
+    if (gateway) {
+      throw new Error(
+        'bedrock/* models cannot be routed through AI Gateway: the gateway\'s Bedrock support uses ' +
+        'its own aws-bedrock endpoint scheme, not the mantle endpoint this provider targets. ' +
+        'Use bedrock/* direct, or route a claude-* model through the gateway instead.',
+      );
+    }
+    const region = env.AWS_BEDROCK_REGION as string | undefined;
+    const token = env.AWS_BEARER_TOKEN_BEDROCK as string | undefined;
+    if (!region) {
+      throw new Error(
+        'Bedrock models require AWS_BEDROCK_REGION in env (e.g. "eu-west-1"). ' +
+        'Pick the region deliberately — it decides where prompts are processed.',
+      );
+    }
+    if (!token) {
+      throw new Error(
+        'Bedrock models require AWS_BEARER_TOKEN_BEDROCK in env (a long-term Amazon Bedrock API key).',
+      );
+    }
+    const id = modelId.slice('bedrock/'.length);
+    return createAnthropic({
+      // The /v1 suffix is load-bearing: the Anthropic provider treats baseURL as
+      // already containing the version segment and appends only /messages.
+      baseURL: `https://bedrock-mantle.${region}.api.aws/anthropic/v1`,
+      // Bedrock authenticates with `Authorization: Bearer`. The SDK insists on
+      // an apiKey (sent as x-api-key), so the token rides both headers — same
+      // credential, same host.
+      apiKey: token,
+      headers: { Authorization: `Bearer ${token}`, ...headers },
+    })(id);
   }
 
   // ── OpenAI ────────────────────────────────────────────────────────────────
   // Models: gpt-4o, gpt-4o-mini, gpt-4-turbo, o1, o3-mini, etc.
   // Env:    OPENAI_API_KEY (optional with AI Gateway stored keys)
   if (modelId.startsWith('gpt-') || modelId.startsWith('o1') || modelId.startsWith('o3')) {
-    const opts: { baseURL?: string; apiKey?: string } = {};
+    const opts: { baseURL?: string; apiKey?: string; headers?: Record<string, string> } = {};
     if (gatewayUrl) opts.baseURL = gatewayUrl;
+    if (headers) opts.headers = headers;
     const apiKey = resolveApiKey(env, 'OPENAI_API_KEY', gateway);
     if (apiKey) opts.apiKey = apiKey;
     return viaGateway(createOpenAI(opts)(modelId));
@@ -138,8 +213,9 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   // Models: gemini-2.5-pro, gemini-2.0-flash, gemini-1.5-pro, gemini-1.5-flash, etc.
   // Env:    GOOGLE_AI_API_KEY (optional with AI Gateway stored keys)
   if (modelId.startsWith('gemini-')) {
-    const opts: { baseURL?: string; apiKey?: string } = {};
+    const opts: { baseURL?: string; apiKey?: string; headers?: Record<string, string> } = {};
     if (gatewayUrl) opts.baseURL = gatewayUrl;
+    if (headers) opts.headers = headers;
     const apiKey = resolveApiKey(env, 'GOOGLE_AI_API_KEY', gateway);
     if (apiKey) opts.apiKey = apiKey;
     return viaGateway(createGoogleGenerativeAI(opts)(modelId));
@@ -257,6 +333,6 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   }
 
   throw new Error(
-    `Unsupported model: "${modelId}". Supported prefixes: claude-*, gpt-*, gemini-*, @cf/*, groq/*, deepseek-*, mistral-*, grok-*, sonar*, together/*, command-*, azure/*`,
+    `Unsupported model: "${modelId}". Supported prefixes: claude-*, bedrock/*, gpt-*, gemini-*, @cf/*, groq/*, deepseek-*, mistral-*, grok-*, sonar*, together/*, command-*, azure/*`,
   );
 }

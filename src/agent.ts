@@ -205,7 +205,11 @@ export function createAgent(config: AgentConfig) {
       // Route through Cloudflare AI Gateway if configured.
       // Top-level aiGateway wins over the legacy observability.aiGateway shape.
       const gateway = config.aiGateway ?? config.observability?.aiGateway;
-      const model = await resolveModel(config.model, { env: this.env, gateway });
+      const model = await resolveModel(config.model, {
+        env: this.env,
+        gateway,
+        headers: config.providerHeaders,
+      });
 
       // Build tool context (graph + recursive + env available to all tool handlers)
       const toolCtx: ToolContext = {
@@ -309,7 +313,7 @@ export function createAgent(config: AgentConfig) {
         messages,
         tools,
         maxSteps,
-        onFinish: async ({ response }) => {
+        onFinish: async ({ response, usage, finishReason, providerMetadata }) => {
           if (collector) {
             collector.emit({
               type: 'agent.response',
@@ -317,6 +321,17 @@ export function createAgent(config: AgentConfig) {
               threadId,
               timestamp: Date.now(),
               durationMs: Date.now() - requestStart,
+              // Token usage for cost telemetry. `usage` is the AI SDK's
+              // promptTokens/completionTokens; `providerMetadata` carries the
+              // provider-specific buckets (e.g. Anthropic prompt-cache reads/
+              // writes, which are billed at different rates). Without these the
+              // agent's spend is invisible to the consumer.
+              metadata: {
+                model: config.model,
+                usage,
+                finishReason,
+                providerMetadata,
+              },
             });
           }
 

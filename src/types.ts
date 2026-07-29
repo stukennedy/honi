@@ -154,6 +154,13 @@ export interface AgentConfig {
    * available, else via a `cf-aig-authorization` token.
    */
   aiGateway?: AiGatewayConfig;
+  /**
+   * Extra headers sent on every LLM request, for providers that accept them
+   * (claude-*, bedrock/*, gpt-*, gemini-*). For AI Gateway options (caching,
+   * `collectLog`, metadata) use `aiGateway.options` instead — those work on
+   * the binding path too, where there is no URL to attach headers to.
+   */
+  providerHeaders?: Record<string, string>;
   /** Observability configuration (event collection, AI Gateway). */
   observability?: ObservabilityConfig;
   /** MCP server configuration. */
