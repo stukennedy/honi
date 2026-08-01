@@ -21,7 +21,8 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "test:watch": "bun test --watch"
+    "test:watch": "bun test --watch",
+    "prepublishOnly": "bun run typecheck && bun test && bun run build"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^1.0.0",
