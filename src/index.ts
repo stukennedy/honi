@@ -25,6 +25,7 @@ export type {
   SemanticConfig,
   GraphConfig,
   RecursiveConfig,
+  CacheConfig,
 } from './types.js';
 
 // Providers

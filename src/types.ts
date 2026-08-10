@@ -165,4 +165,37 @@ export interface AgentConfig {
   observability?: ObservabilityConfig;
   /** MCP server configuration. */
   mcp?: McpConfig;
+  /**
+   * Anthropic prompt caching. A large system prompt re-prefilled on every turn
+   * is usually the dominant term in an agent's time-to-first-token; caching it
+   * turns that into a cache read.
+   *
+   * Opt-in, because enabling it changes how the prompt is assembled: the
+   * Anthropic provider reads cache control off a MESSAGE, and a top-level
+   * `system` string carries no `providerOptions`, so the system prompt has to
+   * move into `messages` to be markable at all. With `cache` unset the prompt
+   * is assembled exactly as before.
+   *
+   * `true` enables both breakpoints. Anthropic ignores cache control below a
+   * minimum cacheable prefix (1024 tokens for Opus/Sonnet, 2048 for Haiku) —
+   * silently, with no error — so a small-prompt agent will see no effect.
+   */
+  cache?: boolean | CacheConfig;
+}
+
+export interface CacheConfig {
+  /**
+   * Cache the system prompt. Anthropic serialises `tools` BEFORE `system`, so
+   * this one breakpoint covers the tool schemas too — and both are byte-stable
+   * across every turn of every thread, which is what makes it the big win.
+   * Defaults to true when `cache` is set.
+   */
+  system?: boolean;
+  /**
+   * Also cache the conversation prefix, re-anchored every turn: a turn reads
+   * the cache the previous turn wrote and writes one covering itself, so a
+   * growing thread stays roughly O(1) to prefill instead of O(n).
+   * Defaults to true when `cache` is set.
+   */
+  history?: boolean;
 }

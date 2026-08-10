@@ -553,8 +553,58 @@ Set top-level `aiGateway` to route LLM calls through [Cloudflare AI Gateway](htt
 | `binding`  | `string`              | `"AGENT"`         | Durable Object binding name                |
 | `maxSteps` | `number`              | `10`              | Max tool-calling loop iterations           |
 | `aiGateway` | `AiGatewayConfig`    | —                 | Route LLM calls through CF AI Gateway      |
+| `cache`    | `boolean \| CacheConfig` | `false`       | Anthropic prompt caching (see below)       |
 
 Returns `{ fetch, DurableObject }`.
+
+### Prompt caching (Anthropic)
+
+A large system prompt re-prefilled on every turn is usually the dominant term in
+an agent's time-to-first-token. `cache: true` places two Anthropic cache
+breakpoints so that work happens once:
+
+```ts
+createAgent({
+  name: 'support',
+  model: 'claude-haiku-4-5',
+  system: BIG_SYSTEM_PROMPT,
+  tools,
+  memory: { enabled: true },
+  cache: true,
+});
+```
+
+| Breakpoint | Covers | Why |
+| ---------- | ------ | --- |
+| `cache.system` | tools + system prompt | Anthropic serialises tools ahead of system, so one marker covers both — and both are byte-stable across every turn of every thread. |
+| `cache.history` | the conversation prefix, re-anchored each turn | Each turn reads the cache the previous turn wrote, so a growing thread stays roughly O(1) to prefill instead of O(n). |
+
+Both default to on when `cache` is set; opt out individually with
+`cache: { history: false }`.
+
+Caching is **off by default** because turning it on changes how the prompt is
+assembled. The Anthropic provider reads cache control off a *message*, and a
+top-level `system` string carries no `providerOptions` — so the system prompt
+has to move into `messages` to be markable at all. With `cache` unset the prompt
+is assembled exactly as before.
+
+Worth knowing:
+
+- Anthropic ignores cache control below a **minimum cacheable prefix** — 1024
+  tokens for Opus/Sonnet, 2048 for Haiku — silently, with no error. A
+  small-prompt agent will see no effect and no warning.
+- The default **TTL is 5 minutes**, refreshed on every read. Turns seconds apart
+  keep it warm; a long gap costs one cold prefill.
+- A cache write is 1.25x base input, a read 0.1x — so with a large stable prefix
+  this is a cost saving as well as a latency one.
+- Anthropic allows 4 breakpoints; this uses 2.
+- The `anthropic` namespace is ignored by other providers, but the assembly
+  change applies to all of them. The AI SDK normalises both forms to the same
+  internal prompt, so it should be equivalent — the opt-in default is there so
+  nobody finds out the hard way.
+- To confirm it is working, read the cache buckets off `providerMetadata` on the
+  `agent.response` observability event: `cacheReadInputTokens` should climb and
+  `inputTokens` collapse from the second turn on.
 
 ### `tool(config)`
 

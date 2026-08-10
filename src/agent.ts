@@ -10,6 +10,79 @@ import { ObservabilityCollector } from './observability.js';
 import { createMcpServer } from './mcp.js';
 import type { AgentConfig, ToolDefinition, ToolContext } from './types.js';
 
+/**
+ * Anthropic's cache marker. The provider accepts `cacheControl` or
+ * `cache_control` under its own namespace; every other provider ignores a
+ * namespace it doesn't recognise, so this is inert for them.
+ */
+const ANTHROPIC_CACHE_MARK = {
+  anthropic: { cacheControl: { type: 'ephemeral' } },
+} as const;
+
+/** `cache: true` means both breakpoints; an object opts out per breakpoint. */
+function resolveCache(cache: AgentConfig['cache']): { system: boolean; history: boolean } {
+  if (!cache) return { system: false, history: false };
+  if (cache === true) return { system: true, history: true };
+  return { system: cache.system !== false, history: cache.history !== false };
+}
+
+/**
+ * Assemble a turn's prompt, placing Anthropic cache breakpoints when asked.
+ *
+ * Returns `system` separately from `messages` because the two are mutually
+ * exclusive: caching the system prompt REQUIRES carrying it as a message (the
+ * provider reads cache control off `providerOptions`, and a top-level `system`
+ * string has nowhere to put it), while leaving caching off must reproduce the
+ * previous shape byte-for-byte. `system: undefined` means "it's in `messages`".
+ *
+ * Exported for tests — the placement of breakpoints is the whole behaviour, and
+ * it is worth asserting without standing up a Durable Object.
+ */
+export function buildPrompt(input: {
+  systemPrompt: string;
+  history: CoreMessage[];
+  message: string;
+  cache: AgentConfig['cache'];
+}): { messages: CoreMessage[]; system: string | undefined } {
+  const cache = resolveCache(input.cache);
+
+  const turn: CoreMessage[] = [
+    ...input.history,
+    { role: 'user' as const, content: input.message },
+  ];
+
+  // Breakpoint 2 — the conversation prefix up to, but NOT including, this
+  // turn's user message. Marking the last message of `history` is what makes
+  // the cache compound: this turn reads what the previous turn wrote, and
+  // writes one covering itself for the next. Marking the new user message
+  // instead would write a cache nothing ever reads.
+  if (cache.history && input.history.length > 0) {
+    const prefixEnd = turn.length - 2;
+    turn[prefixEnd] = {
+      ...turn[prefixEnd],
+      providerOptions: ANTHROPIC_CACHE_MARK,
+    } as CoreMessage;
+  }
+
+  // Breakpoint 1 — tools + system, the stable bulk of the prompt. Anthropic
+  // serialises tools ahead of system, so this single breakpoint covers both.
+  if (input.systemPrompt && cache.system) {
+    return {
+      messages: [
+        {
+          role: 'system' as const,
+          content: input.systemPrompt,
+          providerOptions: ANTHROPIC_CACHE_MARK,
+        },
+        ...turn,
+      ],
+      system: undefined,
+    };
+  }
+
+  return { messages: turn, system: input.systemPrompt || undefined };
+}
+
 function buildTools(
   tools: ToolDefinition[],
   ctx: ToolContext,
@@ -302,14 +375,16 @@ export function createAgent(config: AgentConfig) {
         }
       }
 
-      const messages: CoreMessage[] = [
-        ...history,
-        { role: 'user' as const, content: body.message },
-      ];
+      const { messages, system } = buildPrompt({
+        systemPrompt,
+        history,
+        message: body.message,
+        cache: config.cache,
+      });
 
       const result = streamText({
         model,
-        system: systemPrompt || undefined,
+        ...(system === undefined ? {} : { system }),
         messages,
         tools,
         maxSteps,
