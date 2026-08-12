@@ -6,6 +6,10 @@ export function tool<T extends z.ZodType>(config: {
   description: string;
   input: T;
   handler: (input: z.infer<T>, ctx?: ToolContext) => Promise<unknown>;
+  onInvalidArguments?: (
+    rawArgs: unknown,
+    zodError: z.ZodError,
+  ) => unknown | Promise<unknown>;
 }): ToolDefinition<T> {
   return config;
 }

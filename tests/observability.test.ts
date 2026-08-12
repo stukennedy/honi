@@ -66,6 +66,32 @@ describe('ObservabilityCollector', () => {
     expect(received[0].type).toBe('workflow.start');
   });
 
+  it('collects tool repair events', () => {
+    collector.emit({
+      type: 'tool.repair',
+      agentName: 'ratings-agent',
+      timestamp: 123,
+      metadata: {
+        tool: 'submitRatings',
+        attempt: 1,
+        outcome: 'handled',
+      },
+    });
+
+    expect(collector.getEvents()).toEqual([
+      {
+        type: 'tool.repair',
+        agentName: 'ratings-agent',
+        timestamp: 123,
+        metadata: {
+          tool: 'submitRatings',
+          attempt: 1,
+          outcome: 'handled',
+        },
+      },
+    ]);
+  });
+
   it('logs in debug mode', () => {
     const logs: string[] = [];
     const originalLog = console.log;

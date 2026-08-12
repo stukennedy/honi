@@ -43,4 +43,33 @@ describe('tool()', () => {
     const invalid = t.input.safeParse({ message: 123 });
     expect(invalid.success).toBe(false);
   });
+
+  it('preserves an invalid-argument handler on the tool definition', async () => {
+    const validationError = new z.ZodError([
+      {
+        code: 'invalid_enum_value',
+        options: ['IC', 'Manager'],
+        path: ['seniorityBand'],
+        received: 'Senior Manager',
+        message: "Invalid enum value. Expected 'IC' | 'Manager', received 'Senior Manager'",
+      },
+    ]);
+    const t = tool({
+      name: 'submitRatings',
+      description: 'Submit final ratings',
+      input: z.object({ seniorityBand: z.enum(['IC', 'Manager']) }),
+      handler: async () => 'submitted',
+      onInvalidArguments: async (rawArgs, error) => ({
+        rawArgs,
+        issue: error.issues[0]?.code,
+      }),
+    });
+
+    await expect(
+      t.onInvalidArguments?.({ seniorityBand: 'Senior Manager' }, validationError),
+    ).resolves.toEqual({
+      rawArgs: { seniorityBand: 'Senior Manager' },
+      issue: 'invalid_enum_value',
+    });
+  });
 });

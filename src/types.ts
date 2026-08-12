@@ -20,6 +20,11 @@ export interface ToolDefinition<T extends z.ZodType = z.ZodType> {
   input: T;
   /** Handler receives parsed input and optional context (graph, env). */
   handler: (input: z.infer<T>, ctx?: ToolContext) => Promise<unknown>;
+  /** Convert invalid model arguments into a tool result, or return null to use default repair. */
+  onInvalidArguments?: (
+    rawArgs: unknown,
+    zodError: z.ZodError,
+  ) => unknown | Promise<unknown>;
 }
 
 export interface EpisodicConfig {

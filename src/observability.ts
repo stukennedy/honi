@@ -11,6 +11,7 @@ export type HoniEventType =
   | 'agent.request'
   | 'agent.response'
   | 'tool.call'
+  | 'tool.repair'
   | 'tool.result'
   | 'memory.load'
   | 'memory.save'
