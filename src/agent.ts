@@ -8,7 +8,7 @@ import { GraphMemory } from './graph.js';
 import { RecursiveMemory } from './recursive.js';
 import { ObservabilityCollector } from './observability.js';
 import { createMcpServer } from './mcp.js';
-import { buildToolRuntime } from './tool-runtime.js';
+import { buildToolRuntime, formatToolError } from './tool-runtime.js';
 import type { AgentConfig, ToolContext } from './types.js';
 
 /**
@@ -343,6 +343,7 @@ export function createAgent(config: AgentConfig) {
         messages,
         tools,
         maxSteps,
+        experimental_repairToolCall: toolRuntime?.repairToolCall,
         onFinish: async ({ response, usage, finishReason, providerMetadata }) => {
           if (collector) {
             collector.emit({
@@ -405,7 +406,7 @@ export function createAgent(config: AgentConfig) {
         },
       });
 
-      return result.toDataStreamResponse();
+      return result.toDataStreamResponse({ getErrorMessage: formatToolError });
     }
   }
 
