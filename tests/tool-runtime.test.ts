@@ -13,7 +13,13 @@ const ratingsInput = z.object({
 const unusedModel = {} as LanguageModel;
 
 type ProviderStreamPart =
-  | { type: 'tool-call'; toolCallType: 'function'; toolCallId: string; toolName: string; args: string }
+  | {
+      type: 'tool-call';
+      toolCallType: 'function';
+      toolCallId: string;
+      toolName: string;
+      args: string;
+    }
   | { type: 'text-delta'; textDelta: string }
   | {
       type: 'finish';
@@ -21,10 +27,7 @@ type ProviderStreamPart =
       usage: { promptTokens: number; completionTokens: number };
     };
 
-function createScriptedModel(input: {
-  streams: ProviderStreamPart[][];
-  repairs?: string[];
-}) {
+function createScriptedModel(input: { streams: ProviderStreamPart[][]; repairs?: string[] }) {
   const streamCalls: unknown[] = [];
   const generateCalls: unknown[] = [];
   const streams = [...input.streams];
@@ -58,7 +61,11 @@ function createScriptedModel(input: {
         finishReason: 'stop',
         usage: { promptTokens: 1, completionTokens: 1 },
         rawCall: { rawPrompt: options.prompt, rawSettings: {} },
-        response: { id: 'repair-1', timestamp: new Date(0), modelId: 'test-model' },
+        response: {
+          id: 'repair-1',
+          timestamp: new Date(0),
+          modelId: 'test-model',
+        },
         warnings: [],
         providerMetadata: undefined,
       };
@@ -68,9 +75,15 @@ function createScriptedModel(input: {
 }
 
 function validationValue(parameters: unknown, value: unknown): unknown {
-  const result = (parameters as {
-    validate: (input: unknown) => { success: boolean; value?: unknown; error?: Error };
-  }).validate(value);
+  const result = (
+    parameters as {
+      validate: (input: unknown) => {
+        success: boolean;
+        value?: unknown;
+        error?: Error;
+      };
+    }
+  ).validate(value);
   if (!result.success) throw result.error;
   return result.value;
 }
@@ -124,10 +137,56 @@ describe('buildToolRuntime()', () => {
 
     expect(result).toEqual({ submitted: 'Manager' });
     expect(handler).toHaveBeenCalledWith({ seniorityBand: 'Manager' }, {});
-    expect(collector.getEvents().map((event) => event.type)).toEqual([
-      'tool.call',
-      'tool.result',
-    ]);
+    expect(collector.getEvents().map((event) => event.type)).toEqual(['tool.call', 'tool.result']);
+    expect(collector.getEvents()[0]?.metadata).toEqual({
+      tool: 'submitRatings',
+      argumentCount: 1,
+    });
+  });
+
+  it('records failed tools without exposing arguments or raw error messages', async () => {
+    const collector = new ObservabilityCollector();
+    const runtime = buildToolRuntime({
+      definitions: [
+        tool({
+          name: 'submitRatings',
+          description: 'Submit final ratings',
+          input: ratingsInput,
+          handler: async () => {
+            throw new RangeError('private learner evidence');
+          },
+        }),
+      ],
+      context: {},
+      model: unusedModel,
+      collector,
+      agentName: 'ratings-agent',
+      threadId: 'thread-1',
+    });
+
+    await expect(
+      runtime.tools.submitRatings.execute?.(
+        { seniorityBand: 'Manager' },
+        { toolCallId: 'call-1', messages: [] },
+      ),
+    ).rejects.toThrow('private learner evidence');
+
+    const events = collector.getEvents();
+    expect(events[0]?.metadata).toEqual({
+      tool: 'submitRatings',
+      argumentCount: 1,
+    });
+    expect(events[1]).toMatchObject({
+      type: 'tool.result',
+      metadata: {
+        tool: 'submitRatings',
+        outcome: 'failed',
+        errorType: 'RangeError',
+      },
+    });
+    expect(events[1]?.error).toBeUndefined();
+    expect(JSON.stringify(events)).not.toContain('private learner evidence');
+    expect(JSON.stringify(events)).not.toContain('Manager');
   });
 
   it('turns a local invalid-argument response into the tool result', async () => {
@@ -205,7 +264,10 @@ describe('buildToolRuntime()', () => {
           },
         ],
         [
-          { type: 'text-delta', textDelta: 'Your ratings were submitted. Goodbye!' },
+          {
+            type: 'text-delta',
+            textDelta: 'Your ratings were submitted. Goodbye!',
+          },
           {
             type: 'finish',
             finishReason: 'stop',
@@ -231,6 +293,10 @@ describe('buildToolRuntime()', () => {
       ],
       context: {},
       model: scripted.model,
+      modelSettings: {
+        maxTokens: 128,
+        providerOptions: { anthropic: { thinking: { type: 'disabled' } } },
+      },
       collector,
       agentName: 'ratings-agent',
       threadId: 'thread-1',
@@ -252,6 +318,10 @@ describe('buildToolRuntime()', () => {
     expect(handled).toEqual([{ seniorityBand: 'Manager' }]);
     expect(onFinish).toHaveBeenCalledTimes(1);
     expect(scripted.generateCalls).toHaveLength(1);
+    expect(scripted.generateCalls[0]).toMatchObject({
+      maxTokens: 128,
+      providerMetadata: { anthropic: { thinking: { type: 'disabled' } } },
+    });
     expect(JSON.stringify(scripted.generateCalls[0])).toContain('submitRatings');
     expect(JSON.stringify(scripted.generateCalls[0])).toContain('Senior Manager');
     expect(JSON.stringify(scripted.generateCalls[0])).toContain('invalid_enum_value');

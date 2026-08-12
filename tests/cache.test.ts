@@ -170,4 +170,37 @@ describe('buildAgentStreamOptions — cache-stable references', () => {
     expect(options.tools).toBe(tools);
     expect(options.experimental_repairToolCall).toBe(repairToolCall);
   });
+
+  it('passes common and provider-specific AI SDK model settings through unchanged', () => {
+    const providerOptions = {
+      anthropic: { thinking: { type: 'disabled' as const } },
+      google: { thinkingConfig: { thinkingBudget: 0, includeThoughts: false } },
+      openai: { reasoningEffort: 'low' },
+    };
+    const modelSettings = {
+      maxTokens: 512,
+      temperature: 0,
+      topP: 0.9,
+      topK: 20,
+      presencePenalty: 0.1,
+      frequencyPenalty: 0.2,
+      stopSequences: ['<END>'],
+      seed: 42,
+      maxRetries: 1,
+      providerOptions,
+    };
+
+    const options = buildAgentStreamOptions({
+      model: {} as never,
+      system: undefined,
+      messages: [],
+      tools: undefined,
+      repairToolCall: undefined,
+      maxSteps: 3,
+      modelSettings,
+    });
+
+    expect(options).toMatchObject(modelSettings);
+    expect(options.providerOptions).toBe(providerOptions);
+  });
 });

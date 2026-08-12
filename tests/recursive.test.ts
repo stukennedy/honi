@@ -186,10 +186,22 @@ describe('RecursiveMemory', () => {
       'What version of Bridge do I need for an ARM Mac?',
       mockModel as any,
       'You are a support agent.',
+      undefined,
+      undefined,
+      {
+        maxTokens: 256,
+        providerOptions: { google: { thinkingConfig: { thinkingBudget: 0 } } },
+      },
     );
 
     expect(result.answer).toBeTruthy();
     expect(typeof result.iterations).toBe('number');
     expect(Array.isArray(result.chunksRead)).toBe(true);
+    expect(mockModel.doGenerate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        maxTokens: 256,
+        providerMetadata: { google: { thinkingConfig: { thinkingBudget: 0 } } },
+      }),
+    );
   });
 });

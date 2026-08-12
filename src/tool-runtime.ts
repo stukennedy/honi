@@ -13,6 +13,7 @@ import {
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import type { ObservabilityCollector } from './observability.js';
 import type { ToolContext, ToolDefinition } from './types.js';
+import type { ModelSettings } from './types.js';
 
 const invalidArguments = Symbol('honi.invalidArguments');
 
@@ -79,10 +80,7 @@ export function formatToolError(error: unknown): string {
     if (current === null || current === undefined || seen.has(current)) continue;
     seen.add(current);
 
-    if (
-      InvalidToolArgumentsError.isInstance(current) ||
-      NoSuchToolError.isInstance(current)
-    ) {
+    if (InvalidToolArgumentsError.isInstance(current) || NoSuchToolError.isInstance(current)) {
       return formatNamedToolError(current);
     }
     if (ToolExecutionError.isInstance(current)) executionError ??= current;
@@ -111,7 +109,13 @@ async function executeHandler(
     agentName,
     threadId,
     timestamp: start,
-    metadata: { tool: definition.name, args },
+    metadata: {
+      tool: definition.name,
+      argumentCount:
+        typeof args === 'object' && args !== null && !Array.isArray(args)
+          ? Object.keys(args).length
+          : 0,
+    },
   });
   try {
     const result = await definition.handler(args, context);
@@ -121,7 +125,7 @@ async function executeHandler(
       threadId,
       timestamp: Date.now(),
       durationMs: Date.now() - start,
-      metadata: { tool: definition.name },
+      metadata: { tool: definition.name, outcome: 'completed' },
     });
     return result;
   } catch (error) {
@@ -131,8 +135,11 @@ async function executeHandler(
       threadId,
       timestamp: Date.now(),
       durationMs: Date.now() - start,
-      metadata: { tool: definition.name },
-      error: (error as Error).message,
+      metadata: {
+        tool: definition.name,
+        outcome: 'failed',
+        errorType: error instanceof Error ? error.name : 'UnknownError',
+      },
     });
     throw error;
   }
@@ -142,14 +149,13 @@ export function buildToolRuntime(input: {
   definitions: ToolDefinition[];
   context: ToolContext;
   model: LanguageModel;
+  modelSettings?: ModelSettings;
   collector?: ObservabilityCollector;
   agentName: string;
   threadId?: string;
 }): ToolRuntime {
   const tools: RuntimeToolSet = {};
-  const definitions = new Map(
-    input.definitions.map((definition) => [definition.name, definition]),
-  );
+  const definitions = new Map(input.definitions.map((definition) => [definition.name, definition]));
 
   const repairToolCall: ToolCallRepairFunction<RuntimeToolSet> = async ({
     toolCall,
@@ -184,6 +190,7 @@ export function buildToolRuntime(input: {
         'Return corrected arguments only.',
       ].join(' ');
       const repair = await generateText({
+        ...input.modelSettings,
         model: input.model,
         ...(system === undefined ? {} : { system }),
         messages: [

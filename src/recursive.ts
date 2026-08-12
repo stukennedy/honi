@@ -14,7 +14,7 @@
 import { generateText, tool } from 'ai';
 import type { LanguageModel } from 'ai';
 import { z } from 'zod';
-import type { RecursiveConfig } from './types.js';
+import type { ModelSettings, RecursiveConfig } from './types.js';
 
 const DEFAULT_CHUNK_SIZE = 800;
 const DEFAULT_MAX_DEPTH = 10;
@@ -221,6 +221,7 @@ export class RecursiveMemory {
     systemPrompt: string,
     maxDepth?: number,
     timeoutMs?: number,
+    modelSettings?: ModelSettings,
   ): Promise<RlmResult> {
     const depth = maxDepth ?? this.config.maxDepth ?? DEFAULT_MAX_DEPTH;
     const timeout = timeoutMs ?? this.config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -264,6 +265,7 @@ export class RecursiveMemory {
     ].filter(Boolean).join('\n\n');
 
     const { text } = await generateText({
+      ...modelSettings,
       model,
       system: combinedSystem,
       messages: [{ role: 'user', content: userMessage }],
