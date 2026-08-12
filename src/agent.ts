@@ -1,5 +1,11 @@
 import { Hono } from 'hono';
-import { streamText, type CoreMessage } from 'ai';
+import {
+  streamText,
+  type CoreMessage,
+  type LanguageModel,
+  type ToolCallRepairFunction,
+  type ToolSet,
+} from 'ai';
 import { resolveModel } from './providers.js';
 import { ThreadMemory } from './memory.js';
 import { EpisodicMemory } from './episodic.js';
@@ -82,6 +88,25 @@ export function buildPrompt(input: {
   }
 
   return { messages: turn, system: input.systemPrompt || undefined };
+}
+
+/** Assemble cache-sensitive stream inputs without cloning their stable references. */
+export function buildAgentStreamOptions<TOOLS extends ToolSet>(input: {
+  model: LanguageModel;
+  system: string | undefined;
+  messages: CoreMessage[];
+  tools: TOOLS | undefined;
+  repairToolCall: ToolCallRepairFunction<TOOLS> | undefined;
+  maxSteps: number;
+}) {
+  return {
+    model: input.model,
+    ...(input.system === undefined ? {} : { system: input.system }),
+    messages: input.messages,
+    tools: input.tools,
+    maxSteps: input.maxSteps,
+    experimental_repairToolCall: input.repairToolCall,
+  };
 }
 
 export function createAgent(config: AgentConfig) {
@@ -338,12 +363,14 @@ export function createAgent(config: AgentConfig) {
       });
 
       const result = streamText({
-        model,
-        ...(system === undefined ? {} : { system }),
-        messages,
-        tools,
-        maxSteps,
-        experimental_repairToolCall: toolRuntime?.repairToolCall,
+        ...buildAgentStreamOptions({
+          model,
+          system,
+          messages,
+          tools,
+          repairToolCall: toolRuntime?.repairToolCall,
+          maxSteps,
+        }),
         onFinish: async ({ response, usage, finishReason, providerMetadata }) => {
           if (collector) {
             collector.emit({

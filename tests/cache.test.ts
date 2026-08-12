@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import type { CoreMessage } from 'ai';
-import { buildPrompt } from '../src/agent.js';
+import type { CoreMessage, LanguageModel, ToolCallRepairFunction, ToolSet } from 'ai';
+import { buildAgentStreamOptions, buildPrompt } from '../src/agent.js';
 
 const SYSTEM = 'You are a helpful assistant with a long, stable system prompt.';
 
@@ -145,5 +145,29 @@ describe('buildPrompt — per-breakpoint opt-out', () => {
       cache: {},
     });
     expect(messages.filter((m) => optionsOf(m) !== undefined)).toHaveLength(2);
+  });
+});
+
+describe('buildAgentStreamOptions — cache-stable references', () => {
+  it('passes system, messages, and tools through without rebuilding them', () => {
+    const system = SYSTEM;
+    const messages: CoreMessage[] = [{ role: 'user', content: 'submit ratings' }];
+    const tools: ToolSet = {};
+    const repairToolCall = (async () => null) as ToolCallRepairFunction<ToolSet>;
+    const model = {} as LanguageModel;
+
+    const options = buildAgentStreamOptions({
+      model,
+      system,
+      messages,
+      tools,
+      repairToolCall,
+      maxSteps: 3,
+    });
+
+    expect(options.system).toBe(system);
+    expect(options.messages).toBe(messages);
+    expect(options.tools).toBe(tools);
+    expect(options.experimental_repairToolCall).toBe(repairToolCall);
   });
 });

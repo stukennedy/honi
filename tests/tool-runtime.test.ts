@@ -411,4 +411,70 @@ describe('buildToolRuntime()', () => {
       outcome: 'no-such-tool',
     });
   });
+
+  it('leaves valid stream calls unchanged', async () => {
+    const scripted = createScriptedModel({
+      streams: [
+        [
+          {
+            type: 'tool-call',
+            toolCallType: 'function',
+            toolCallId: 'call-1',
+            toolName: 'submitRatings',
+            args: JSON.stringify({ seniorityBand: 'Director+' }),
+          },
+          {
+            type: 'finish',
+            finishReason: 'tool-calls',
+            usage: { promptTokens: 1, completionTokens: 1 },
+          },
+        ],
+        [
+          { type: 'text-delta', textDelta: 'Submitted.' },
+          {
+            type: 'finish',
+            finishReason: 'stop',
+            usage: { promptTokens: 1, completionTokens: 1 },
+          },
+        ],
+      ],
+    });
+    const handled: unknown[] = [];
+    const collector = new ObservabilityCollector();
+    const runtime = buildToolRuntime({
+      definitions: [
+        tool({
+          name: 'submitRatings',
+          description: 'Submit final ratings',
+          input: ratingsInput,
+          handler: async (args) => {
+            handled.push(args);
+            return { submitted: true };
+          },
+        }),
+      ],
+      context: {},
+      model: scripted.model,
+      collector,
+      agentName: 'ratings-agent',
+    });
+    const onFinish = mock(async () => {});
+    const result = streamText({
+      model: scripted.model,
+      system: 'You are a ratings agent.',
+      messages: [{ role: 'user', content: 'Submit my ratings.' }],
+      tools: runtime.tools,
+      maxSteps: 3,
+      experimental_repairToolCall: runtime.repairToolCall,
+      onFinish,
+    });
+
+    const responseBody = await result.toDataStreamResponse().text();
+
+    expect(responseBody).toContain('Submitted.');
+    expect(handled).toEqual([{ seniorityBand: 'Director+' }]);
+    expect(onFinish).toHaveBeenCalledTimes(1);
+    expect(scripted.generateCalls).toHaveLength(0);
+    expect(collector.getEvents().some((event) => event.type === 'tool.repair')).toBe(false);
+  });
 });
