@@ -12,10 +12,10 @@ import { EpisodicMemory } from './episodic.js';
 import { SemanticMemory } from './semantic.js';
 import { GraphMemory } from './graph.js';
 import { RecursiveMemory } from './recursive.js';
-import { ObservabilityCollector } from './observability.js';
+import { measurePhase, ObservabilityCollector } from './observability.js';
 import { createMcpServer } from './mcp.js';
 import { buildToolRuntime, formatToolError } from './tool-runtime.js';
-import type { AgentConfig, ToolContext } from './types.js';
+import type { AgentConfig, ModelSettings, ToolContext } from './types.js';
 
 /**
  * Anthropic's cache marker. The provider accepts `cacheControl` or
@@ -27,7 +27,10 @@ const ANTHROPIC_CACHE_MARK = {
 } as const;
 
 /** `cache: true` means both breakpoints; an object opts out per breakpoint. */
-function resolveCache(cache: AgentConfig['cache']): { system: boolean; history: boolean } {
+function resolveCache(cache: AgentConfig['cache']): {
+  system: boolean;
+  history: boolean;
+} {
   if (!cache) return { system: false, history: false };
   if (cache === true) return { system: true, history: true };
   return { system: cache.system !== false, history: cache.history !== false };
@@ -53,10 +56,7 @@ export function buildPrompt(input: {
 }): { messages: CoreMessage[]; system: string | undefined } {
   const cache = resolveCache(input.cache);
 
-  const turn: CoreMessage[] = [
-    ...input.history,
-    { role: 'user' as const, content: input.message },
-  ];
+  const turn: CoreMessage[] = [...input.history, { role: 'user' as const, content: input.message }];
 
   // Breakpoint 2 — the conversation prefix up to, but NOT including, this
   // turn's user message. Marking the last message of `history` is what makes
@@ -98,8 +98,10 @@ export function buildAgentStreamOptions<TOOLS extends ToolSet>(input: {
   tools: TOOLS | undefined;
   repairToolCall: ToolCallRepairFunction<TOOLS> | undefined;
   maxSteps: number;
+  modelSettings?: ModelSettings;
 }) {
   return {
+    ...input.modelSettings,
     model: input.model,
     ...(input.system === undefined ? {} : { system: input.system }),
     messages: input.messages,
@@ -113,11 +115,6 @@ export function createAgent(config: AgentConfig) {
   const binding = config.binding ?? 'AGENT';
   const maxSteps = config.maxSteps ?? 10;
 
-  // Create observability collector if configured
-  const collector = config.observability
-    ? new ObservabilityCollector(config.observability)
-    : undefined;
-
   class AgentDO implements DurableObject {
     /** @internal */ memory: ThreadMemory;
     /** @internal */ state: DurableObjectState;
@@ -127,11 +124,15 @@ export function createAgent(config: AgentConfig) {
     graph: GraphMemory | null = null;
     /** @internal */ recursive: RecursiveMemory | null = null;
     /** @internal */ env: Record<string, unknown>;
+    /** @internal */ collector: ObservabilityCollector | undefined;
 
     constructor(ctx: DurableObjectState, env: unknown) {
       this.state = ctx;
       this.env = env as Record<string, unknown>;
       this.memory = new ThreadMemory(ctx.storage);
+      this.collector = config.observability
+        ? new ObservabilityCollector(config.observability, (task) => ctx.waitUntil(task))
+        : undefined;
 
       // Initialize episodic memory if configured
       if (config.memory?.episodic?.enabled) {
@@ -170,9 +171,14 @@ export function createAgent(config: AgentConfig) {
 
         if (graphCfg.binding) {
           // Service binding: CF-internal, zero-latency
-          const fetcher = this.env[graphCfg.binding] as { fetch: (req: Request) => Promise<Response> } | undefined;
+          const fetcher = this.env[graphCfg.binding] as
+            { fetch: (req: Request) => Promise<Response> } | undefined;
           if (fetcher) {
-            this.graph = new GraphMemory({ graphId: graphCfg.graphId, fetcher, apiKey });
+            this.graph = new GraphMemory({
+              graphId: graphCfg.graphId,
+              fetcher,
+              apiKey,
+            });
           } else {
             console.warn(
               `[honi] Graph memory enabled but service binding "${graphCfg.binding}" not found.`,
@@ -182,7 +188,11 @@ export function createAgent(config: AgentConfig) {
           // HTTP transport
           const url = this.env[graphCfg.urlEnvVar] as string | undefined;
           if (url) {
-            this.graph = new GraphMemory({ graphId: graphCfg.graphId, url, apiKey });
+            this.graph = new GraphMemory({
+              graphId: graphCfg.graphId,
+              url,
+              apiKey,
+            });
           } else {
             console.warn(
               `[honi] Graph memory enabled but env var "${graphCfg.urlEnvVar}" not found.`,
@@ -234,206 +244,454 @@ export function createAgent(config: AgentConfig) {
       }
 
       // POST — chat
+      const collector = this.collector;
       const requestStart = Date.now();
-      const body = (await request.json()) as { message: string };
-
-      if (collector) {
-        collector.emit({
-          type: 'agent.request',
+      let firstChunkEmitted = false;
+      let stepIndex = 0;
+      let terminalEmitted = false;
+      const emitTerminal = (error?: unknown): void => {
+        if (terminalEmitted) return;
+        terminalEmitted = true;
+        collector?.emit({
+          type: 'agent.turn.complete',
           agentName: config.name,
           threadId,
           timestamp: requestStart,
-          metadata: { messageLength: body.message.length },
+          durationMs: Math.max(0, Date.now() - requestStart),
+          metadata: error
+            ? {
+                outcome: 'failed',
+                errorType: error instanceof Error ? error.name : 'UnknownError',
+                stepCount: stepIndex,
+                firstChunkEmitted,
+              }
+            : { outcome: 'completed', stepCount: stepIndex, firstChunkEmitted },
         });
-      }
-
-      // Route through Cloudflare AI Gateway if configured.
-      // Top-level aiGateway wins over the legacy observability.aiGateway shape.
-      const gateway = config.aiGateway ?? config.observability?.aiGateway;
-      const model = await resolveModel(config.model, {
-        env: this.env,
-        gateway,
-        headers: config.providerHeaders,
-      });
-
-      // Build tool context (graph + recursive + env available to all tool handlers)
-      const toolCtx: ToolContext = {
-        graph: this.graph ?? undefined,
-        recursive: this.recursive ?? undefined,
-        env: this.env,
       };
-      const toolRuntime = config.tools?.length
-        ? buildToolRuntime({
-            definitions: config.tools,
-            context: toolCtx,
-            model,
-            collector,
+
+      try {
+        const body = (await request.json()) as { message: string };
+
+        if (collector) {
+          collector.emit({
+            type: 'agent.request',
             agentName: config.name,
             threadId,
-          })
-        : undefined;
-      const tools = toolRuntime?.tools;
-
-      // Load history: prefer episodic (D1) if available, else DO storage
-      const episodicLimit = config.memory?.episodic?.limit ?? 50;
-      let history: CoreMessage[] = [];
-      if (this.episodic) {
-        history = await this.episodic.load(config.name, threadId, episodicLimit);
-      } else if (config.memory?.enabled) {
-        history = await this.memory.load();
-      }
-
-      // Build system prompt with layered memory context
-      let systemPrompt = config.system ?? '';
-
-      // Semantic context: embed user message and search for relevant past episodes
-      let semanticEntityIds: string[] = [];
-      if (this.semantic) {
-        const topK = config.memory?.semantic?.topK ?? 3;
-        const results = await this.semantic.search(body.message, topK);
-        if (results.length > 0) {
-          const contextLines = results.map(
-            (r) => `- ${r.text} (similarity: ${r.score.toFixed(2)})`,
-          );
-          const contextBlock = [
-            '[Relevant context from past conversations:]',
-            ...contextLines,
-            '[End of context]',
-            '',
-          ].join('\n');
-          systemPrompt = contextBlock + systemPrompt;
-
-          // Collect entity IDs from semantic result metadata for graph expansion
-          semanticEntityIds = results
-            .flatMap((r) => [r.metadata?.entityId, r.metadata?.nodeId])
-            .filter((id): id is string => typeof id === 'string');
+            timestamp: requestStart,
+            metadata: { messageLength: body.message.length },
+          });
         }
-      }
 
-      // Recursive (RLM) memory: run the REPL loop if enabled.
-      // The loop runs before the final streamText call and injects its
-      // reasoned answer as additional context into the system prompt.
-      if (this.recursive) {
-        const recursiveCfg = config.memory?.recursive;
-        try {
-          const rlmResult = await this.recursive.runLoop(
-            body.message,
-            model,
-            systemPrompt,
-            recursiveCfg?.maxDepth,
-            recursiveCfg?.timeoutMs,
-          );
-          if (rlmResult.answer) {
-            const rlmContext = [
-              '[Document research result — ' + rlmResult.iterations + ' iterations, '
-                + rlmResult.chunksRead.length + ' chunks read:]',
-              rlmResult.answer,
-              '[End of research]',
-              '',
-            ].join('\n');
-            systemPrompt = rlmContext + systemPrompt;
-          }
-        } catch (err) {
-          console.warn('[honi] RLM loop failed — falling back to direct response:', (err as Error).message);
-        }
-      }
+        // Route through Cloudflare AI Gateway if configured.
+        // Top-level aiGateway wins over the legacy observability.aiGateway shape.
+        const gateway = config.aiGateway ?? config.observability?.aiGateway;
+        const model = await measurePhase(
+          collector,
+          {
+            type: 'agent.phase',
+            agentName: config.name,
+            threadId,
+            metadata: { phase: 'model.resolve', model: config.model },
+          },
+          () =>
+            resolveModel(config.model, {
+              env: this.env,
+              gateway,
+              headers: config.providerHeaders,
+            }),
+        );
 
-      // Graph context: expand semantic hits + any entity IDs in the user message metadata
-      // Graph context is prepended before semantic context so it appears earliest in the prompt
-      if (this.graph) {
-        const graphCfg = config.memory?.graph;
-        const maxEntities = graphCfg?.maxContextEntities ?? 5;
-        const contextDepth = graphCfg?.contextDepth ?? 1;
+        // Build tool context (graph + recursive + env available to all tool handlers)
+        const toolCtx: ToolContext = {
+          graph: this.graph ?? undefined,
+          recursive: this.recursive ?? undefined,
+          env: this.env,
+        };
+        const toolRuntime = config.tools?.length
+          ? await measurePhase(
+              collector,
+              {
+                type: 'agent.phase',
+                agentName: config.name,
+                threadId,
+                metadata: {
+                  phase: 'tools.build',
+                  toolCount: config.tools.length,
+                },
+              },
+              () =>
+                buildToolRuntime({
+                  definitions: config.tools!,
+                context: toolCtx,
+                model,
+                modelSettings: config.modelSettings,
+                  collector,
+                  agentName: config.name,
+                  threadId,
+                }),
+            )
+          : undefined;
+        const tools = toolRuntime?.tools;
 
-        // Limit how many entities we expand to avoid token blowout
-        const entityIds = semanticEntityIds.slice(0, maxEntities);
-        if (entityIds.length > 0) {
-          const graphContext = await this.graph.toContext(entityIds, contextDepth);
-          if (graphContext) {
-            systemPrompt = graphContext + '\n\n' + systemPrompt;
-          }
-        }
-      }
-
-      const { messages, system } = buildPrompt({
-        systemPrompt,
-        history,
-        message: body.message,
-        cache: config.cache,
-      });
-
-      const result = streamText({
-        ...buildAgentStreamOptions({
-          model,
-          system,
-          messages,
-          tools,
-          repairToolCall: toolRuntime?.repairToolCall,
-          maxSteps,
-        }),
-        onFinish: async ({ response, usage, finishReason, providerMetadata }) => {
-          if (collector) {
-            collector.emit({
-              type: 'agent.response',
+        // Load history: prefer episodic (D1) if available, else DO storage
+        const episodicLimit = config.memory?.episodic?.limit ?? 50;
+        let history: CoreMessage[] = [];
+        if (this.episodic) {
+          history = await measurePhase(
+            collector,
+            {
+              type: 'memory.load',
               agentName: config.name,
               threadId,
-              timestamp: Date.now(),
-              durationMs: Date.now() - requestStart,
-              // Token usage for cost telemetry. `usage` is the AI SDK's
-              // promptTokens/completionTokens; `providerMetadata` carries the
-              // provider-specific buckets (e.g. Anthropic prompt-cache reads/
-              // writes, which are billed at different rates). Without these the
-              // agent's spend is invisible to the consumer.
               metadata: {
-                model: config.model,
-                usage,
-                finishReason,
-                providerMetadata,
+                phase: 'history.load',
+                source: 'episodic',
+                limit: episodicLimit,
               },
-            });
-          }
+            },
+            () => this.episodic!.load(config.name, threadId, episodicLimit),
+          );
+        } else if (config.memory?.enabled) {
+          history = await measurePhase(
+            collector,
+            {
+              type: 'memory.load',
+              agentName: config.name,
+              threadId,
+              metadata: { phase: 'history.load', source: 'durable-object' },
+            },
+            () => this.memory.load(),
+          );
+        }
 
-          const newMessages: CoreMessage[] = [
-            { role: 'user' as const, content: body.message },
-            ...(response.messages as CoreMessage[]),
-          ];
+        // Build system prompt with layered memory context
+        let systemPrompt = config.system ?? '';
 
-          // Save to DO working memory
-          if (config.memory?.enabled) {
-            await this.memory.append(newMessages);
-          }
-
-          // Save to D1 episodic memory
-          if (this.episodic) {
-            await this.episodic.append(config.name, threadId, newMessages);
-          }
-
-          // Upsert to Vectorize semantic memory
-          if (this.semantic) {
-            // Index the user message
-            await this.semantic.upsert(
-              crypto.randomUUID(),
-              body.message,
-              { agent: config.name, thread: threadId, role: 'user' },
+        // Semantic context: embed user message and search for relevant past episodes
+        let semanticEntityIds: string[] = [];
+        if (this.semantic) {
+          const topK = config.memory?.semantic?.topK ?? 3;
+          const results = await measurePhase(
+            collector,
+            {
+              type: 'agent.phase',
+              agentName: config.name,
+              threadId,
+              metadata: { phase: 'memory.semantic.search', topK },
+            },
+            () => this.semantic!.search(body.message, topK),
+          );
+          if (results.length > 0) {
+            const contextLines = results.map(
+              (r) => `- ${r.text} (similarity: ${r.score.toFixed(2)})`,
             );
-            // Index assistant responses
-            for (const msg of response.messages) {
-              if (msg.role === 'assistant' && typeof msg.content === 'string') {
-                await this.semantic.upsert(
-                  crypto.randomUUID(),
-                  msg.content,
-                  { agent: config.name, thread: threadId, role: 'assistant' },
-                );
-              }
+            const contextBlock = [
+              '[Relevant context from past conversations:]',
+              ...contextLines,
+              '[End of context]',
+              '',
+            ].join('\n');
+            systemPrompt = contextBlock + systemPrompt;
+
+            // Collect entity IDs from semantic result metadata for graph expansion
+            semanticEntityIds = results
+              .flatMap((r) => [r.metadata?.entityId, r.metadata?.nodeId])
+              .filter((id): id is string => typeof id === 'string');
+          }
+        }
+
+        // Recursive (RLM) memory: run the REPL loop if enabled.
+        // The loop runs before the final streamText call and injects its
+        // reasoned answer as additional context into the system prompt.
+        if (this.recursive) {
+          const recursiveCfg = config.memory?.recursive;
+          try {
+            const rlmResult = await measurePhase(
+              collector,
+              {
+                type: 'agent.phase',
+                agentName: config.name,
+                threadId,
+                metadata: { phase: 'memory.recursive.run' },
+              },
+              () =>
+                this.recursive!.runLoop(
+                  body.message,
+                  model,
+                  systemPrompt,
+                recursiveCfg?.maxDepth,
+                recursiveCfg?.timeoutMs,
+                config.modelSettings,
+              ),
+            );
+            if (rlmResult.answer) {
+              const rlmContext = [
+                '[Document research result — ' +
+                  rlmResult.iterations +
+                  ' iterations, ' +
+                  rlmResult.chunksRead.length +
+                  ' chunks read:]',
+                rlmResult.answer,
+                '[End of research]',
+                '',
+              ].join('\n');
+              systemPrompt = rlmContext + systemPrompt;
+            }
+          } catch (err) {
+            console.warn(
+              '[honi] RLM loop failed — falling back to direct response:',
+              (err as Error).message,
+            );
+          }
+        }
+
+        // Graph context: expand semantic hits + any entity IDs in the user message metadata
+        // Graph context is prepended before semantic context so it appears earliest in the prompt
+        if (this.graph) {
+          const graphCfg = config.memory?.graph;
+          const maxEntities = graphCfg?.maxContextEntities ?? 5;
+          const contextDepth = graphCfg?.contextDepth ?? 1;
+
+          // Limit how many entities we expand to avoid token blowout
+          const entityIds = semanticEntityIds.slice(0, maxEntities);
+          if (entityIds.length > 0) {
+            const graphContext = await measurePhase(
+              collector,
+              {
+                type: 'agent.phase',
+                agentName: config.name,
+                threadId,
+                metadata: {
+                  phase: 'memory.graph.context',
+                  entityCount: entityIds.length,
+                  contextDepth,
+                },
+              },
+              () => this.graph!.toContext(entityIds, contextDepth),
+            );
+            if (graphContext) {
+              systemPrompt = graphContext + '\n\n' + systemPrompt;
             }
           }
+        }
 
-          // Recursive memory stores its documents in DO storage;
-          // no per-turn bookkeeping needed in onFinish.
-        },
-      });
+        const { messages, system } = await measurePhase(
+          collector,
+          {
+            type: 'agent.phase',
+            agentName: config.name,
+            threadId,
+            metadata: {
+              phase: 'prompt.build',
+              historyMessageCount: history.length,
+            },
+          },
+          () =>
+            buildPrompt({
+              systemPrompt,
+              history,
+              message: body.message,
+              cache: config.cache,
+            }),
+        );
 
-      return result.toDataStreamResponse({ getErrorMessage: formatToolError });
+        const providerStartedAt = Date.now();
+        let stepStartedAt = providerStartedAt;
+        const result = await measurePhase(
+          collector,
+          {
+            type: 'agent.phase',
+            agentName: config.name,
+            threadId,
+            metadata: { phase: 'provider.stream.create', model: config.model },
+          },
+          () =>
+            streamText({
+              ...buildAgentStreamOptions({
+                model,
+                system,
+                messages,
+                tools,
+              repairToolCall: toolRuntime?.repairToolCall,
+              maxSteps,
+              modelSettings: config.modelSettings,
+            }),
+              onChunk: () => {
+                if (firstChunkEmitted || !collector) return;
+                firstChunkEmitted = true;
+                collector.emit({
+                  type: 'agent.stream.first_chunk',
+                  agentName: config.name,
+                  threadId,
+                  timestamp: providerStartedAt,
+                  durationMs: Math.max(0, Date.now() - providerStartedAt),
+                  metadata: { outcome: 'first_output', model: config.model },
+                });
+              },
+              onStepFinish: ({ finishReason, usage }) => {
+                const finishedAt = Date.now();
+                collector?.emit({
+                  type: 'agent.step',
+                  agentName: config.name,
+                  threadId,
+                  timestamp: stepStartedAt,
+                  durationMs: Math.max(0, finishedAt - stepStartedAt),
+                  metadata: {
+                    outcome: 'completed',
+                    stepIndex,
+                    finishReason,
+                    promptTokens: usage.promptTokens,
+                    completionTokens: usage.completionTokens,
+                  },
+                });
+                stepIndex += 1;
+                stepStartedAt = finishedAt;
+              },
+              onError: ({ error }) => emitTerminal(error),
+              onFinish: async ({ response, usage, finishReason, providerMetadata }) => {
+                try {
+                  if (collector) {
+                    collector.emit({
+                      type: 'agent.response',
+                      agentName: config.name,
+                      threadId,
+                      timestamp: Date.now(),
+                      durationMs: Date.now() - requestStart,
+                      // Token usage for cost telemetry. `usage` is the AI SDK's
+                      // promptTokens/completionTokens; `providerMetadata` carries the
+                      // provider-specific buckets (e.g. Anthropic prompt-cache reads/
+                      // writes, which are billed at different rates). Without these the
+                      // agent's spend is invisible to the consumer.
+                      metadata: {
+                        model: config.model,
+                        usage,
+                        finishReason,
+                        providerMetadata,
+                      },
+                    });
+                  }
+
+                  const newMessages: CoreMessage[] = [
+                    { role: 'user' as const, content: body.message },
+                    ...(response.messages as CoreMessage[]),
+                  ];
+
+                  // Save to DO working memory
+                  if (config.memory?.enabled) {
+                    await measurePhase(
+                      collector,
+                      {
+                        type: 'memory.save',
+                        agentName: config.name,
+                        threadId,
+                        metadata: {
+                          phase: 'working_memory.save',
+                          messageCount: newMessages.length,
+                        },
+                      },
+                      () => this.memory.append(newMessages),
+                    );
+                  }
+
+                  // Save to D1 episodic memory
+                  if (this.episodic) {
+                    await measurePhase(
+                      collector,
+                      {
+                        type: 'memory.save',
+                        agentName: config.name,
+                        threadId,
+                        metadata: {
+                          phase: 'episodic.save',
+                          messageCount: newMessages.length,
+                        },
+                      },
+                      () => this.episodic!.append(config.name, threadId, newMessages),
+                    );
+                  }
+
+                  // Upsert to Vectorize semantic memory
+                  if (this.semantic) {
+                    await measurePhase(
+                      collector,
+                      {
+                        type: 'memory.save',
+                        agentName: config.name,
+                        threadId,
+                        metadata: {
+                          phase: 'semantic.save',
+                          messageCount: newMessages.length,
+                        },
+                      },
+                      async () => {
+                        // Index the user message
+                        await this.semantic!.upsert(crypto.randomUUID(), body.message, {
+                          agent: config.name,
+                          thread: threadId,
+                          role: 'user',
+                        });
+                        // Index assistant responses
+                        for (const msg of response.messages) {
+                          if (msg.role === 'assistant' && typeof msg.content === 'string') {
+                            await this.semantic!.upsert(crypto.randomUUID(), msg.content, {
+                              agent: config.name,
+                              thread: threadId,
+                              role: 'assistant',
+                            });
+                          }
+                        }
+                      },
+                    );
+                  }
+
+                  // Recursive memory stores its documents in DO storage;
+                  // no per-turn bookkeeping needed in onFinish.
+                } catch (error) {
+                  emitTerminal(error);
+                  throw error;
+                } finally {
+                  emitTerminal();
+                }
+              },
+            }),
+        );
+
+        const response = result.toDataStreamResponse({ getErrorMessage: formatToolError });
+        if (!response.body) return response;
+
+        // AI SDK/provider adapters do not consistently invoke `onError` for an
+        // underlying stream failure. Observe the actual response body as the
+        // final lifecycle boundary so every consumed turn gets one terminal event.
+        const reader = response.body.getReader();
+        const monitoredBody = new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            try {
+              const next = await reader.read();
+              if (next.done) {
+                emitTerminal();
+                controller.close();
+              } else {
+                controller.enqueue(next.value);
+              }
+            } catch (error) {
+              emitTerminal(error);
+              controller.error(error);
+            }
+          },
+          async cancel(reason) {
+            emitTerminal(reason ?? new DOMException('Stream cancelled', 'AbortError'));
+            await reader.cancel(reason);
+          },
+        });
+        return new Response(monitoredBody, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
+      } catch (error) {
+        emitTerminal(error);
+        throw error;
+      }
     }
   }
 
@@ -489,7 +747,9 @@ export function createAgent(config: AgentConfig) {
           return c.json({ error: 'Unauthorized' }, 401);
         }
       } else {
-        console.warn(`[honi] mcp.secretEnvVar "${config.mcp.secretEnvVar}" is set but env var not found — MCP endpoint is unauthenticated`);
+        console.warn(
+          `[honi] mcp.secretEnvVar "${config.mcp.secretEnvVar}" is set but env var not found — MCP endpoint is unauthenticated`,
+        );
       }
     }
 
@@ -501,11 +761,13 @@ export function createAgent(config: AgentConfig) {
     const threadId = c.req.header('x-thread-id') ?? c.req.query('threadId') ?? 'default';
     const id = ns.idFromName(threadId);
     const stub = ns.get(id);
-    return stub.fetch(new Request('https://do/mcp', { 
-      method: 'POST', 
-      body: await c.req.text(),
-      headers: { 'content-type': 'application/json' }
-    }));
+    return stub.fetch(
+      new Request('https://do/mcp', {
+        method: 'POST',
+        body: await c.req.text(),
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
   });
 
   // MCP tools list (convenience GET endpoint)
@@ -514,8 +776,7 @@ export function createAgent(config: AgentConfig) {
     return c.json({ tools: mcpServer.tools });
   });
 
-  const fetchHandler: ExportedHandlerFetchHandler = (req, env, ctx) =>
-    app.fetch(req, env, ctx);
+  const fetchHandler: ExportedHandlerFetchHandler = (req, env, ctx) => app.fetch(req, env, ctx);
 
   return { fetch: fetchHandler, DurableObject: AgentDO };
 }

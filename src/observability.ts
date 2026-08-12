@@ -4,12 +4,22 @@ export interface ObservabilityConfig {
   /** @deprecated Set `aiGateway` at the top level of `createAgent()` config instead. */
   aiGateway?: AiGatewayConfig & { accountId: string };
   logLevel?: 'none' | 'error' | 'warn' | 'info' | 'debug';
-  onEvent?: (event: HoniEvent) => void;
+  /**
+   * Retain emitted events for `getEvents()`. Disable this for long-lived agent
+   * isolates that export every event through `onEvent`, avoiding an unbounded
+   * in-memory history. Defaults to true for backwards compatibility.
+   */
+  captureEvents?: boolean;
+  onEvent?: (event: HoniEvent) => void | Promise<void>;
 }
 
 export type HoniEventType =
   | 'agent.request'
   | 'agent.response'
+  | 'agent.phase'
+  | 'agent.stream.first_chunk'
+  | 'agent.step'
+  | 'agent.turn.complete'
   | 'tool.call'
   | 'tool.repair'
   | 'tool.result'
@@ -30,14 +40,28 @@ export interface HoniEvent {
   error?: string;
 }
 
+type PhaseEvent = Omit<HoniEvent, 'timestamp' | 'durationMs' | 'error'>;
+
 export class ObservabilityCollector {
   private events: HoniEvent[] = [];
 
-  constructor(private config: ObservabilityConfig = {}) {}
+  constructor(
+    private config: ObservabilityConfig = {},
+    private waitUntil?: (task: Promise<unknown>) => void,
+  ) {}
 
   emit(event: HoniEvent): void {
-    this.events.push(event);
-    if (this.config.onEvent) this.config.onEvent(event);
+    if (this.config.captureEvents !== false) this.events.push(event);
+    try {
+      const task = this.config.onEvent?.(event);
+      if (task && typeof task.then === 'function') {
+        const safeTask = Promise.resolve(task).catch(() => undefined);
+        if (this.waitUntil) this.waitUntil(safeTask);
+        else void safeTask;
+      }
+    } catch {
+      // Observability is best-effort and must never alter an agent turn.
+    }
     if (this.config.logLevel === 'debug') {
       console.log(`[honi:${event.type}]`, JSON.stringify(event));
     }
@@ -63,6 +87,41 @@ export class ObservabilityCollector {
     if (!this.config.aiGateway) return undefined;
     const { accountId, gatewayId } = this.config.aiGateway;
     return `https://gateway.ai.cloudflare.com/v1/${accountId}/${gatewayId}/${provider}/v1`;
+  }
+}
+
+/**
+ * Time one agent phase and emit its terminal outcome without recording the
+ * operation's inputs, outputs, or error message. Agent consumers frequently
+ * handle learner content, so phase telemetry is deliberately metadata-only.
+ */
+export async function measurePhase<T>(
+  collector: ObservabilityCollector | undefined,
+  event: PhaseEvent,
+  operation: () => T | Promise<T>,
+): Promise<T> {
+  const startedAt = Date.now();
+  try {
+    const result = await operation();
+    collector?.emit({
+      ...event,
+      timestamp: startedAt,
+      durationMs: Math.max(0, Date.now() - startedAt),
+      metadata: { ...event.metadata, outcome: 'completed' },
+    });
+    return result;
+  } catch (error) {
+    collector?.emit({
+      ...event,
+      timestamp: startedAt,
+      durationMs: Math.max(0, Date.now() - startedAt),
+      metadata: {
+        ...event.metadata,
+        outcome: 'failed',
+        errorType: error instanceof Error ? error.name : 'UnknownError',
+      },
+    });
+    throw error;
   }
 }
 

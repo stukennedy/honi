@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.8.1 — 2026-08-13
+
+### Added
+
+- Agent turns now emit phase timings for model resolution, tool setup, history loading,
+  semantic/recursive/graph memory, prompt construction, provider stream creation, first output,
+  every model step, persistence, and the complete turn.
+- `captureEvents: false` streams events through `onEvent` without retaining an unbounded
+  isolate-local event history.
+- `modelSettings` exposes AI SDK generation controls and its provider-specific `providerOptions`
+  escape hatch, including thinking/reasoning controls, without Honi translating or dropping them.
+- Async observers are attached to the Durable Object lifetime, while observer failures remain
+  isolated from learner turns. Terminal events now cover success, persistence failure, provider
+  stream failure, and cancellation without exposing raw error messages.
+
+### Security
+
+- Tool observability no longer records tool arguments or raw error messages. Events retain only
+  the tool name, argument count, duration, outcome, and error class.
+
 ## 0.8.0 — 2026-08-12
 
 ### Added

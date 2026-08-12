@@ -66,6 +66,60 @@ describe('ObservabilityCollector', () => {
     expect(received[0].type).toBe('workflow.start');
   });
 
+  it('can stream events to a callback without retaining an unbounded history', () => {
+    const received: HoniEvent[] = [];
+    const collector = new ObservabilityCollector({
+      captureEvents: false,
+      onEvent: (event) => received.push(event),
+    });
+
+    collector.emit({
+      type: 'memory.load',
+      agentName: 'scan-agent',
+      timestamp: 123,
+    });
+
+    expect(received).toHaveLength(1);
+    expect(collector.getEvents()).toEqual([]);
+  });
+
+  it('does not let a throwing observer break its caller', () => {
+    const collector = new ObservabilityCollector({
+      onEvent: () => {
+        throw new Error('telemetry sink unavailable');
+      },
+    });
+
+    expect(() =>
+      collector.emit({
+        type: 'agent.request',
+        agentName: 'scan-agent',
+        timestamp: 123,
+      }),
+    ).not.toThrow();
+  });
+
+  it('hands asynchronous observers to the runtime lifetime without rejecting it', async () => {
+    const tasks: Promise<unknown>[] = [];
+    const collector = new ObservabilityCollector(
+      {
+        onEvent: async () => {
+          throw new Error('telemetry transport unavailable');
+        },
+      },
+      (task) => tasks.push(task),
+    );
+
+    collector.emit({
+      type: 'agent.turn.complete',
+      agentName: 'scan-agent',
+      timestamp: 123,
+    });
+
+    expect(tasks).toHaveLength(1);
+    await expect(tasks[0]).resolves.toBeUndefined();
+  });
+
   it('collects tool repair events', () => {
     collector.emit({
       type: 'tool.repair',

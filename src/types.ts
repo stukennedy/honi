@@ -145,6 +145,12 @@ export interface AgentConfig {
    * Workers AI models run on the AI binding in wrangler.toml — no API key needed.
    */
   model: string;
+  /**
+   * AI SDK generation controls passed to every model step. `providerOptions`
+   * is the provider-owned escape hatch for capabilities such as Anthropic
+   * thinking, Gemini thinking budgets, and OpenAI reasoning effort.
+   */
+  modelSettings?: ModelSettings;
   system?: string;
   memory?: MemoryConfig;
   tools?: ToolDefinition[];
@@ -186,6 +192,28 @@ export interface AgentConfig {
    * silently, with no error — so a small-prompt agent will see no effect.
    */
   cache?: boolean | CacheConfig;
+}
+
+export type ModelSettingJson =
+  | null
+  | string
+  | number
+  | boolean
+  | ModelSettingJson[]
+  | { [key: string]: ModelSettingJson };
+
+export interface ModelSettings {
+  maxTokens?: number;
+  temperature?: number;
+  topP?: number;
+  topK?: number;
+  presencePenalty?: number;
+  frequencyPenalty?: number;
+  stopSequences?: string[];
+  seed?: number;
+  maxRetries?: number;
+  /** Provider namespace → options, passed through without interpretation. */
+  providerOptions?: Record<string, Record<string, ModelSettingJson>>;
 }
 
 export interface CacheConfig {

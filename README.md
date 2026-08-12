@@ -493,6 +493,8 @@ const agent = createAgent({
   name: 'my-agent',
   model: 'claude-sonnet-4-5',
   observability: {
+    // Recommended for long-lived isolates when onEvent exports every event.
+    captureEvents: false,
     logLevel: 'debug',
     onEvent: (event) => {
       // Send to your logging/analytics service
@@ -507,7 +509,11 @@ const agent = createAgent({
 | Event | Emitted When |
 | --- | --- |
 | `agent.request` | Incoming chat request |
+| `agent.phase` | Model resolution, tool setup, prompt construction, and optional memory-context phases finish |
+| `agent.stream.first_chunk` | First provider output arrives; `durationMs` is provider time-to-first-output |
+| `agent.step` | One AI SDK model/tool-loop step finishes |
 | `agent.response` | Response stream complete — `metadata` carries `model`, `usage`, `finishReason`, `providerMetadata` |
+| `agent.turn.complete` | Response and all configured persistence have finished |
 | `tool.call` | Tool execution starts |
 | `tool.result` | Tool execution finishes |
 | `memory.load` | Memory loaded from storage |
@@ -516,6 +522,10 @@ const agent = createAgent({
 | `workflow.step` | Workflow step executes |
 | `workflow.complete` | Workflow finishes |
 | `workflow.error` | Workflow errors |
+
+Phase, memory, and tool events are content-free: they carry timings, bounded counts, model/tool
+names, outcomes, and error classes, never prompts, model output, tool arguments, tool results, or
+raw error messages.
 
 ### Token usage & cost telemetry
 
@@ -547,6 +557,7 @@ Set top-level `aiGateway` to route LLM calls through [Cloudflare AI Gateway](htt
 | ---------- | --------------------- | ----------------- | ------------------------------------------ |
 | `name`     | `string`              | —                 | Agent name                                 |
 | `model`    | `string`              | —                 | Model ID (`claude-sonnet-4-5`, `gpt-4o`)   |
+| `modelSettings` | `ModelSettings`     | —                 | AI SDK generation + provider controls      |
 | `system`   | `string`              | —                 | System prompt                              |
 | `memory`   | `MemoryConfig`        | `{}`                 | Memory configuration (see Phase 2)      |
 | `tools`    | `ToolDefinition[]`    | `[]`              | Agent tools                                |
@@ -556,6 +567,36 @@ Set top-level `aiGateway` to route LLM calls through [Cloudflare AI Gateway](htt
 | `cache`    | `boolean \| CacheConfig` | `false`       | Anthropic prompt caching (see below)       |
 
 Returns `{ fetch, DurableObject }`.
+
+### Model controls (AI SDK)
+
+`modelSettings` passes the AI SDK's common generation controls to every step:
+`maxTokens`, `temperature`, `topP`, `topK`, presence/frequency penalties, stop
+sequences, seed, and retry count. Provider-specific capabilities go under the
+AI SDK's `providerOptions` namespace and are passed through unchanged:
+
+```ts
+createAgent({
+  name: 'voice-agent',
+  model: 'claude-haiku-4-5',
+  modelSettings: {
+    temperature: 0,
+    maxTokens: 512,
+    providerOptions: {
+      anthropic: { thinking: { type: 'disabled' } },
+      // Gemini alternative:
+      // google: { thinkingConfig: { thinkingBudget: 0, includeThoughts: false } },
+      // OpenAI alternative:
+      // openai: { reasoningEffort: 'low' },
+    },
+  },
+});
+```
+
+Honi deliberately does not invent a cross-provider `thinking` abstraction:
+providers expose different semantics, and the provider adapter remains the
+authority. Unsupported options are handled according to that adapter/model's
+normal AI SDK behavior.
 
 ### Prompt caching (Anthropic)
 
