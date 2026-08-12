@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { streamText, tool as aiTool, type CoreMessage } from 'ai';
+import { streamText, type CoreMessage } from 'ai';
 import { resolveModel } from './providers.js';
 import { ThreadMemory } from './memory.js';
 import { EpisodicMemory } from './episodic.js';
@@ -8,7 +8,8 @@ import { GraphMemory } from './graph.js';
 import { RecursiveMemory } from './recursive.js';
 import { ObservabilityCollector } from './observability.js';
 import { createMcpServer } from './mcp.js';
-import type { AgentConfig, ToolDefinition, ToolContext } from './types.js';
+import { buildToolRuntime } from './tool-runtime.js';
+import type { AgentConfig, ToolContext } from './types.js';
 
 /**
  * Anthropic's cache marker. The provider accepts `cacheControl` or
@@ -81,60 +82,6 @@ export function buildPrompt(input: {
   }
 
   return { messages: turn, system: input.systemPrompt || undefined };
-}
-
-function buildTools(
-  tools: ToolDefinition[],
-  ctx: ToolContext,
-  collector?: ObservabilityCollector,
-  agentName?: string,
-  threadId?: string,
-) {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const result: Record<string, any> = {};
-  for (const t of tools) {
-    result[t.name] = aiTool({
-      description: t.description,
-      parameters: t.input,
-      execute: async (args) => {
-        if (collector) {
-          const start = Date.now();
-          collector.emit({
-            type: 'tool.call',
-            agentName: agentName!,
-            threadId,
-            timestamp: start,
-            metadata: { tool: t.name, args },
-          });
-          try {
-            const toolResult = await t.handler(args, ctx);
-            collector.emit({
-              type: 'tool.result',
-              agentName: agentName!,
-              threadId,
-              timestamp: Date.now(),
-              durationMs: Date.now() - start,
-              metadata: { tool: t.name },
-            });
-            return toolResult;
-          } catch (err) {
-            collector.emit({
-              type: 'tool.result',
-              agentName: agentName!,
-              threadId,
-              timestamp: Date.now(),
-              durationMs: Date.now() - start,
-              metadata: { tool: t.name },
-              error: (err as Error).message,
-            });
-            throw err;
-          }
-        }
-        return t.handler(args, ctx);
-      },
-    });
-  }
-  return result;
 }
 
 export function createAgent(config: AgentConfig) {
@@ -290,9 +237,17 @@ export function createAgent(config: AgentConfig) {
         recursive: this.recursive ?? undefined,
         env: this.env,
       };
-      const tools = config.tools?.length
-        ? buildTools(config.tools, toolCtx, collector, config.name, threadId)
+      const toolRuntime = config.tools?.length
+        ? buildToolRuntime({
+            definitions: config.tools,
+            context: toolCtx,
+            model,
+            collector,
+            agentName: config.name,
+            threadId,
+          })
         : undefined;
+      const tools = toolRuntime?.tools;
 
       // Load history: prefer episodic (D1) if available, else DO storage
       const episodicLimit = config.memory?.episodic?.limit ?? 50;
