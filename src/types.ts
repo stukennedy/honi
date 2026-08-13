@@ -212,6 +212,18 @@ export interface ModelSettings {
   stopSequences?: string[];
   seed?: number;
   maxRetries?: number;
+  /**
+   * Stream tool calls incrementally: the data-protocol response emits a
+   * tool-call-streaming-start part (`b:`) the moment the model BEGINS
+   * composing a tool call, followed by argument deltas (`c:`), instead of a
+   * single `9:` part only once the call's arguments have fully generated.
+   *
+   * Realtime consumers need this: a voice pipeline holding its last spoken
+   * sentence until the stream settles can flush it the instant `b:` arrives,
+   * rather than waiting out the (potentially many seconds of) tool-argument
+   * generation. Text consumers that ignore unknown prefixes are unaffected.
+   */
+  toolCallStreaming?: boolean;
   /** Provider namespace → options, passed through without interpretation. */
   providerOptions?: Record<string, Record<string, ModelSettingJson>>;
 }
