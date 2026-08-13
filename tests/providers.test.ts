@@ -32,6 +32,17 @@ describe('resolveModel — Workers AI (@cf/*)', () => {
       /AI binding/,
     );
   });
+
+  it('routes Workers AI partner-catalog ids (google/*) through the binding, no provider key', async () => {
+    const model = await resolveModel('google/gemini-3.5-flash-lite', {
+      env: { AI: mockAiBinding() },
+    });
+    expect(model.modelId).toBe('google/gemini-3.5-flash-lite');
+    // Missing binding gets the same helpful error as @cf/* — proof of routing.
+    await expect(resolveModel('google/gemini-3.5-flash-lite', { env: {} })).rejects.toThrow(
+      /AI binding/,
+    );
+  });
 });
 
 describe('resolveModel — AI Gateway', () => {

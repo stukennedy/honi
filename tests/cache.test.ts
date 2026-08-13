@@ -187,6 +187,7 @@ describe('buildAgentStreamOptions — cache-stable references', () => {
       stopSequences: ['<END>'],
       seed: 42,
       maxRetries: 1,
+      toolCallStreaming: true,
       providerOptions,
     };
 
