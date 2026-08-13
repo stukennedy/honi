@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.2 — 2026-08-13
+
+### Added
+
+- `modelSettings.toolCallStreaming` streams tool calls incrementally: the data-protocol
+  response emits a tool-call-streaming-start part (`b:`) the moment the model begins
+  composing a tool call, plus argument deltas (`c:`), instead of a single `9:` part only
+  after the arguments fully generate. Built for realtime consumers that flush buffered
+  speech when the tool phase starts.
+- Workers AI partner-catalog model ids (`google/*`, e.g. `google/gemini-3.5-flash-lite`)
+  route through the AI binding with Cloudflare unified billing — no provider API key.
+
 ## 0.8.1 — 2026-08-13
 
 ### Added
