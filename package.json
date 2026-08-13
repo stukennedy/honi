@@ -1,6 +1,6 @@
 {
   "name": "honidev",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -19,6 +19,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "bun run build && bun test",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:watch": "bun test --watch"

@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.8.2 — 2026-08-13
+## 0.8.3 — 2026-08-13
+
+### Fixed
+
+- Republish of 0.8.2, whose npm tarball shipped a stale `dist/` carrying none of its
+  advertised changes (no `prepublishOnly` hook meant the publishing checkout's last local
+  build went out). `prepublishOnly` now rebuilds and tests before every publish. 0.8.2 is
+  deprecated on npm — its features below only actually exist from 0.8.3.
+
+## 0.8.2 — 2026-08-13 (deprecated: published with stale dist)
 
 ### Added
 
