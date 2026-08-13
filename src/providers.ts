@@ -223,8 +223,11 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
 
   // ── Cloudflare Workers AI ─────────────────────────────────────────────────
   // Models: @cf/meta/llama-3.3-70b-instruct, @cf/mistral/mistral-7b-instruct, etc.
+  // Also the partner catalog served through the same binding with Cloudflare
+  // unified billing — e.g. google/gemini-3.5-flash-lite — which needs no
+  // provider API key at all (developers.cloudflare.com/ai/models/google/).
   // Env:    AI binding in wrangler.toml — no API key needed.
-  if (modelId.startsWith('@cf/')) {
+  if (modelId.startsWith('@cf/') || modelId.startsWith('google/')) {
     const ai = env[gateway?.binding ?? 'AI'];
     if (!ai) throw new Error('Workers AI requires an AI binding. Add [ai] binding = "AI" to wrangler.toml');
     const workersai = createWorkersAI({
@@ -333,6 +336,6 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   }
 
   throw new Error(
-    `Unsupported model: "${modelId}". Supported prefixes: claude-*, bedrock/*, gpt-*, gemini-*, @cf/*, groq/*, deepseek-*, mistral-*, grok-*, sonar*, together/*, command-*, azure/*`,
+    `Unsupported model: "${modelId}". Supported prefixes: claude-*, bedrock/*, gpt-*, gemini-*, @cf/*, google/* (Workers AI partner catalog), groq/*, deepseek-*, mistral-*, grok-*, sonar*, together/*, command-*, azure/*`,
   );
 }
