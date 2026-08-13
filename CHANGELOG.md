@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.4 — 2026-08-13
+
+### Fixed
+
+- Workers AI partner-catalog ids (`google/*`, and now `anthropic/*`) no longer route
+  through `workers-ai-provider`, whose native-schema translation broke partner models
+  both ways: tool payloads were rejected with a 400 "User Input Error", and streamed
+  responses collapsed to a single delta (measured live against
+  `google/gemini-3.5-flash-lite`). Partner ids now use the provider family's own AI SDK
+  package — `@ai-sdk/openai` for `google/*` (the partner endpoint accepts OpenAI
+  chat.completions), `@ai-sdk/anthropic` for `anthropic/*` (the Messages API passes
+  through natively) — with a fetch that hands the request to `binding.run()`: the
+  binding does auth + unified billing, the provider does the schema, and tool-call
+  streaming (`b:`/`c:` parts) works.
+
 ## 0.8.3 — 2026-08-13
 
 ### Fixed

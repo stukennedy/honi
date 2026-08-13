@@ -33,13 +33,27 @@ describe('resolveModel — Workers AI (@cf/*)', () => {
     );
   });
 
-  it('routes Workers AI partner-catalog ids (google/*) through the binding, no provider key', async () => {
-    const model = await resolveModel('google/gemini-3.5-flash-lite', {
+  it('routes Workers AI partner-catalog ids through provider-family bridges, no provider key', async () => {
+    // NOT workers-ai-provider: the partner endpoint passes each provider's
+    // native schema through, and the Workers-AI translation breaks tools
+    // (400) and collapses streams to one delta.
+    const gemini = await resolveModel('google/gemini-3.5-flash-lite', {
       env: { AI: mockAiBinding() },
     });
-    expect(model.modelId).toBe('google/gemini-3.5-flash-lite');
+    expect(gemini.modelId).toBe('google/gemini-3.5-flash-lite');
+    expect(gemini.provider).toBe('openai.chat');
+
+    const haiku = await resolveModel('anthropic/claude-haiku-4.5', {
+      env: { AI: mockAiBinding() },
+    });
+    expect(haiku.modelId).toBe('anthropic/claude-haiku-4.5');
+    expect(haiku.provider).toBe('anthropic.messages');
+
     // Missing binding gets the same helpful error as @cf/* — proof of routing.
     await expect(resolveModel('google/gemini-3.5-flash-lite', { env: {} })).rejects.toThrow(
+      /AI binding/,
+    );
+    await expect(resolveModel('anthropic/claude-haiku-4.5', { env: {} })).rejects.toThrow(
       /AI binding/,
     );
   });

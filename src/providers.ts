@@ -221,13 +221,64 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
     return viaGateway(createGoogleGenerativeAI(opts)(modelId));
   }
 
+  // ── Cloudflare Workers AI partner catalog ─────────────────────────────────
+  // Models: google/gemini-3.5-flash-lite, anthropic/claude-haiku-4.5, etc. —
+  // third-party models served through the AI binding on Cloudflare unified
+  // billing: no provider API key (developers.cloudflare.com/ai/models/).
+  //
+  // Deliberately NOT workers-ai-provider: the partner endpoint passes each
+  // provider's NATIVE schema through on both legs, and workers-ai-provider's
+  // Workers-AI translation breaks them BOTH ways (tool payloads are rejected
+  // with a 400 "User Input Error", and streamed chunks parse to a single
+  // collapsed delta — measured live against google/gemini-3.5-flash-lite,
+  // 2026-08-13). Instead: the provider family's own AI SDK package with a
+  // fetch that hands the request to `binding.run()` — the binding does auth +
+  // billing, the provider does the schema, and tool-call streaming (`b:`/`c:`
+  // parts) works.
+  const partnerFamily = modelId.startsWith('google/')
+    ? 'openai' // Google's partner endpoint accepts OpenAI chat.completions.
+    : modelId.startsWith('anthropic/')
+      ? 'anthropic' // Anthropic passes the Messages API through natively.
+      : null;
+  if (partnerFamily) {
+    const ai = env[gateway?.binding ?? 'AI'];
+    if (!ai) throw new Error('Workers AI requires an AI binding. Add [ai] binding = "AI" to wrangler.toml');
+    const binding = ai as Ai;
+    const bindingFetch: typeof fetch = async (_url, init) => {
+      const { model: _model, stream, ...payload } = JSON.parse(String(init?.body ?? '{}')) as {
+        model?: string;
+        stream?: boolean;
+        [key: string]: unknown;
+      };
+      const result = await binding.run(
+        modelId as Parameters<Ai['run']>[0],
+        { ...payload, ...(stream ? { stream: true } : {}) } as Parameters<Ai['run']>[1],
+        ...(gateway ? [{ gateway: { id: gateway.gatewayId } }] : []),
+      );
+      if (stream) {
+        return new Response(result as ReadableStream, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        });
+      }
+      return Response.json(result);
+    };
+    if (partnerFamily === 'anthropic') {
+      return createAnthropic({ apiKey: 'workers-ai-binding', fetch: bindingFetch })(modelId);
+    }
+    const openai = createOpenAI({
+      baseURL: 'https://workers-ai.binding.internal/v1',
+      apiKey: 'workers-ai-binding',
+      compatibility: 'compatible',
+      fetch: bindingFetch,
+    });
+    return openai.chat(modelId);
+  }
+
   // ── Cloudflare Workers AI ─────────────────────────────────────────────────
   // Models: @cf/meta/llama-3.3-70b-instruct, @cf/mistral/mistral-7b-instruct, etc.
-  // Also the partner catalog served through the same binding with Cloudflare
-  // unified billing — e.g. google/gemini-3.5-flash-lite — which needs no
-  // provider API key at all (developers.cloudflare.com/ai/models/google/).
   // Env:    AI binding in wrangler.toml — no API key needed.
-  if (modelId.startsWith('@cf/') || modelId.startsWith('google/')) {
+  if (modelId.startsWith('@cf/')) {
     const ai = env[gateway?.binding ?? 'AI'];
     if (!ai) throw new Error('Workers AI requires an AI binding. Add [ai] binding = "AI" to wrangler.toml');
     const workersai = createWorkersAI({
@@ -336,6 +387,6 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   }
 
   throw new Error(
-    `Unsupported model: "${modelId}". Supported prefixes: claude-*, bedrock/*, gpt-*, gemini-*, @cf/*, google/* (Workers AI partner catalog), groq/*, deepseek-*, mistral-*, grok-*, sonar*, together/*, command-*, azure/*`,
+    `Unsupported model: "${modelId}". Supported prefixes: claude-*, bedrock/*, gpt-*, gemini-*, @cf/*, google/*, anthropic/* (Workers AI partner catalog), groq/*, deepseek-*, mistral-*, grok-*, sonar*, together/*, command-*, azure/*`,
   );
 }
