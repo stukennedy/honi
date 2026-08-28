@@ -128,6 +128,216 @@ function resolveApiKey(
   return gateway ? 'CF_TEMP_TOKEN' : undefined;
 }
 
+/**
+ * Wrap a model so a stream that closes CLEANLY with zero output is re-issued.
+ *
+ * Both the Google direct API and the OpenRouter bridge do this: no error is
+ * thrown, the AI SDK synthesises finishReason 'unknown', the turn ends "done"
+ * and the caller gets silence with a bare unanswered user turn in memory.
+ * This is the only layer that can both detect the zero-output close and act
+ * without buffering — parts are held only until the FIRST usable part, then
+ * it is realtime pass-through.
+ *
+ * Content = output the turn can actually use: non-empty text, or a COMPLETE
+ * tool call. A dangling `tool-call-delta` whose args never finish (the
+ * observed live shape: the stream dies mid-call, finishReason 'unknown', zero
+ * tokens billed) yields nothing upstream and must still trigger the retry.
+ *
+ * `onRetry` lets the caller escalate a provider knob for the rescue attempt
+ * only — the fast path keeps its low-latency setting, and only a retry pays
+ * for the more expensive one.
+ */
+export function withEmptyStreamRetry(
+  model: LanguageModel,
+  opts: { label: string; escalated: boolean; onRetry?: () => void },
+): LanguageModel {
+  type StreamPart = { type?: string; textDelta?: unknown; finishReason?: unknown; error?: unknown };
+  const isContent = (part: StreamPart): boolean =>
+    (part?.type === 'text-delta' && typeof part.textDelta === 'string' && part.textDelta.length > 0) ||
+    part?.type === 'tool-call';
+  const m = model as unknown as Record<string, any>;
+  return {
+    specificationVersion: m.specificationVersion,
+    provider: m.provider,
+    modelId: m.modelId,
+    defaultObjectGenerationMode: m.defaultObjectGenerationMode,
+    supportsImageUrls: m.supportsImageUrls,
+    supportsStructuredOutputs: m.supportsStructuredOutputs,
+    ...(m.supportsUrl ? { supportsUrl: m.supportsUrl.bind(m) } : {}),
+    doGenerate: (options: unknown) => m.doGenerate(options),
+    doStream: async (options: unknown) => {
+      const first = await m.doStream(options);
+      const stream = new ReadableStream({
+        async start(controller) {
+          // Diagnostics per attempt: the upstream finishReason (the AI SDK
+          // later synthesises 'unknown', so this is the only place the REAL
+          // reason is visible) plus what part types the empty stream carried.
+          const pump = async (attempt: { stream: ReadableStream }) => {
+            const reader = attempt.stream.getReader();
+            let sawContent = false;
+            let finishReason: unknown = null;
+            let providerError: string | null = null;
+            const partTypes: Record<string, number> = {};
+            const held: unknown[] = [];
+            // Captured rather than thrown: the caller has to know whether THIS
+            // attempt already forwarded parts downstream before it died, and a
+            // throw loses that with the rest of the state.
+            let failure: unknown;
+            try {
+              for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const part = value as StreamPart;
+                const t = part?.type ?? 'unknown';
+                partTypes[t] = (partTypes[t] ?? 0) + 1;
+                if (t === 'finish' && part.finishReason) finishReason = part.finishReason;
+                if (t === 'error') providerError = String(part.error ?? 'unknown');
+                if (!sawContent && isContent(part)) {
+                  sawContent = true;
+                  for (const h of held) controller.enqueue(h);
+                  held.length = 0;
+                }
+                if (sawContent) controller.enqueue(value);
+                else held.push(value);
+              }
+            } catch (err) {
+              failure = err;
+            }
+            return { sawContent, held, finishReason, providerError, partTypes, failure };
+          };
+          const emptyDiagnostics = (last: Awaited<ReturnType<typeof pump>>) => ({
+            finishReason: last.finishReason,
+            providerError: last.providerError,
+            partTypes: last.partTypes,
+          });
+          const MAX_RETRIES = 2;
+          let last = await pump(first);
+          // A first attempt that dies mid-stream is a genuine failure, not the
+          // clean zero-output close this wrapper exists to rescue — surface it
+          // exactly as an unwrapped model would.
+          if (last.failure) {
+            controller.error(last.failure);
+            return;
+          }
+          for (let attempt = 1; !last.sawContent && attempt <= MAX_RETRIES; attempt++) {
+            console.warn(`[honidev] ${opts.label} empty stream — retrying`, {
+              modelId: m.modelId,
+              attempt,
+              maxRetries: MAX_RETRIES,
+              escalated: opts.escalated,
+              ...emptyDiagnostics(last),
+            });
+            let next: { stream: ReadableStream } | undefined;
+            try {
+              opts.onRetry?.();
+              next = await m.doStream(options);
+            } catch {
+              // Could not even open a retry — degrade to giving up below,
+              // which is the behaviour a caller had before this wrapper.
+              break;
+            }
+            if (!next) break;
+            const result = await pump(next);
+            if (result.failure) {
+              // Anything this attempt forwarded is ALREADY downstream. Closing
+              // cleanly would hand the consumer a truncated turn labelled
+              // success, and appending the first attempt's held parts on top of
+              // it would corrupt the stream outright.
+              if (result.sawContent) {
+                controller.error(result.failure);
+                return;
+              }
+              // Nothing was forwarded, so `last` is still the empty first
+              // attempt and the give-up path below stays correct.
+              break;
+            }
+            last = result;
+          }
+          if (!last.sawContent) {
+            console.warn(`[honidev] ${opts.label} empty stream — giving up`, {
+              modelId: m.modelId,
+              maxRetries: MAX_RETRIES,
+              ...emptyDiagnostics(last),
+            });
+            for (const h of last.held) controller.enqueue(h);
+          }
+          controller.close();
+        },
+      });
+      return { ...first, stream };
+    },
+  } as unknown as LanguageModel;
+}
+
+/**
+ * JSON-schema helpers for OPENROUTER_STRICT_TOOLS. Module scope (not exported
+ * from index.ts, so not public API) purely so they are reachable from tests —
+ * both are pure, and both encode rules that are easy to get subtly wrong.
+ */
+// Widen a schema to admit null. `type` alone is NOT enough: a value has to
+// satisfy `type` AND `enum`/`const`, so `{type:['string','null'], enum:[…]}`
+// still rejects null — and since strict mode also moves the key into
+// `required`, both omission and null would be invalid and an OPTIONAL tool
+// argument would have silently become mandatory.
+export function nullable(schema: any): any {
+  if (schema === null || typeof schema !== 'object') return schema;
+  const widenType = (type: unknown): unknown => {
+    if (typeof type === 'string') return [type, 'null'];
+    if (Array.isArray(type)) return type.includes('null') ? type : [...type, 'null'];
+    return type;
+  };
+  if (Array.isArray(schema.enum)) {
+    return {
+      ...schema,
+      enum: schema.enum.includes(null) ? schema.enum : [...schema.enum, null],
+      ...(schema.type === undefined ? {} : { type: widenType(schema.type) }),
+    };
+  }
+  if (schema.const !== undefined) {
+    // A const cannot be widened in place — the branch has to become a union.
+    const { const: constValue, type, ...rest } = schema;
+    return {
+      ...rest,
+      anyOf: [{ const: constValue, ...(type === undefined ? {} : { type }) }, { type: 'null' }],
+    };
+  }
+  if (schema.type !== undefined) return { ...schema, type: widenType(schema.type) };
+  if (Array.isArray(schema.anyOf)) return { ...schema, anyOf: [...schema.anyOf, { type: 'null' }] };
+  return schema;
+}
+export function strictify(schema: any): any {
+  if (schema === null || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) return schema.map(strictify);
+  const out: Record<string, any> = { ...schema };
+  if (out.type === 'object' && out.properties && typeof out.properties === 'object') {
+    const originallyRequired = new Set<string>(Array.isArray(out.required) ? out.required : []);
+    const props: Record<string, any> = {};
+    for (const [key, value] of Object.entries(out.properties)) {
+      let next = strictify(value);
+      if (!originallyRequired.has(key)) next = nullable(next);
+      props[key] = next;
+    }
+    out.properties = props;
+    out.required = Object.keys(props);
+    out.additionalProperties = false;
+  }
+  if (out.items) out.items = strictify(out.items);
+  for (const key of ['anyOf', 'oneOf', 'allOf']) {
+    if (Array.isArray(out[key])) out[key] = out[key].map(strictify);
+  }
+  if (out.type === undefined && !out.$ref && !out.anyOf && !out.oneOf && !out.allOf) {
+    if (Array.isArray(out.enum) && out.enum.length > 0) {
+      const kinds = [...new Set(out.enum.map((v: unknown) => (v === null ? 'null' : typeof v)))];
+      out.type = kinds.length === 1 ? kinds[0] : kinds;
+    } else if (out.const !== undefined) {
+      out.type = out.const === null ? 'null' : typeof out.const;
+    } else {
+      out.type = 'string';
+    }
+  }
+  return out;
+}
+
 export async function resolveModel(modelId: string, options?: ProviderOptions): Promise<LanguageModel> {
   const gatewayUrl = options?.gatewayUrl;
   const gateway = options?.gateway;
@@ -211,14 +421,132 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
 
   // ── Google Gemini ─────────────────────────────────────────────────────────
   // Models: gemini-2.5-pro, gemini-2.0-flash, gemini-1.5-pro, gemini-1.5-flash, etc.
-  // Env:    GOOGLE_AI_API_KEY (optional with AI Gateway stored keys)
+  // Env:    GOOGLE_AI_API_KEY (required without AI Gateway stored keys — requests
+  //         go straight to generativelanguage.googleapis.com, so a missing key
+  //         must fail loudly here rather than as a per-turn 401/403),
+  //         GOOGLE_THINKING_CONFIG / GOOGLE_THINKING_CONFIG_RETRY /
+  //         GOOGLE_RETRY_EMPTY (optional, see below).
   if (modelId.startsWith('gemini-')) {
-    const opts: { baseURL?: string; apiKey?: string; headers?: Record<string, string> } = {};
+    const opts: {
+      baseURL?: string;
+      apiKey?: string;
+      headers?: Record<string, string>;
+      fetch?: typeof fetch;
+    } = {};
     if (gatewayUrl) opts.baseURL = gatewayUrl;
     if (headers) opts.headers = headers;
     const apiKey = resolveApiKey(env, 'GOOGLE_AI_API_KEY', gateway);
+    // Loud only on the DIRECT route. With no key the request goes straight to
+    // generativelanguage.googleapis.com and can only fail as a per-turn
+    // 401/403, so the missing variable should be named here instead. But the
+    // deprecated `gatewayUrl` override (with `headers` for proxy auth) is a
+    // documented keyless path — a proxy or gateway holds the credential — and
+    // throwing on it would break callers who never had a Google key at all.
+    if (!apiKey && !gatewayUrl) {
+      throw new Error(
+        'gemini-* models require GOOGLE_AI_API_KEY in the Worker env (or an AI Gateway with stored keys, or a gatewayUrl proxy that supplies them).',
+      );
+    }
     if (apiKey) opts.apiKey = apiKey;
-    return viaGateway(createGoogleGenerativeAI(opts)(modelId));
+
+    // GOOGLE_THINKING_CONFIG (raw JSON, e.g. '{"thinkingLevel":"minimal"}' or
+    // '{"thinkingBudget":0}') injects the Gemini API's
+    // `generationConfig.thinkingConfig` into every request body — the knob
+    // that sets thinking effort on models honouring it. It rides the fetch
+    // wrapper below, NOT modelSettings.providerOptions: @ai-sdk/google's
+    // provider-options zod schema admits only thinkingBudget/includeThoughts
+    // and silently STRIPS unknown keys, so thinkingLevel (the 3.x control)
+    // can only reach the wire here.
+    //
+    // GOOGLE_THINKING_CONFIG_RETRY is the config used on an EMPTY-STREAM
+    // RETRY only: gemini-3.5-flash-lite at thinkingLevel "minimal"
+    // intermittently returns MALFORMED_RESPONSE with zero output (live A/B
+    // 2026-08-20: 2/3 empty at minimal, 0/3 at low on the same body) — the
+    // fast path keeps minimal's TTFT, only the rescue pays for the higher
+    // level.
+    const parseThinking = (name: string): unknown => {
+      const raw = env[name] as string | undefined;
+      if (!raw) return undefined;
+      try {
+        return JSON.parse(raw);
+      } catch {
+        throw new Error(`${name} must be valid JSON (e.g. {"thinkingLevel":"minimal"}).`);
+      }
+    };
+    const thinkingConfig = parseThinking('GOOGLE_THINKING_CONFIG');
+    const retryThinkingConfig = parseThinking('GOOGLE_THINKING_CONFIG_RETRY');
+
+    // Pending escalations, consumed by the next outbound fetch. A counter
+    // rather than per-request plumbing because the AI-SDK fetch hook has no
+    // retry context; under concurrency a mis-attributed escalation only makes
+    // an unrelated request think harder — safe by design.
+    let thinkingEscalations = 0;
+
+    // The wrapper is ALWAYS installed on this branch — independent of any
+    // thinking config — because of the thought-signature repair: the Gemini
+    // 3.x API REJECTS (400 INVALID_ARGUMENT) any history functionCall part
+    // without a thoughtSignature, and @ai-sdk/google predates signatures
+    // entirely (strips them from responses, never replays them), so every
+    // post-tool-call turn dies without this. Google's documented escape hatch
+    // for history not produced with signatures is the sentinel below
+    // (ai.google.dev/gemini-api/docs/thought-signatures).
+    opts.fetch = (async (url: string, init?: RequestInit) => {
+      let nextInit = init;
+      try {
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, any>;
+        if (Array.isArray(body.contents)) {
+          for (const content of body.contents) {
+            if (!Array.isArray(content?.parts)) continue;
+            for (const part of content.parts) {
+              if (part && typeof part === 'object' && part.functionCall && !part.thoughtSignature) {
+                part.thoughtSignature = 'context_engineering_is_the_way_to_go';
+              }
+            }
+          }
+        }
+        let effectiveThinking = thinkingConfig;
+        if (thinkingEscalations > 0 && retryThinkingConfig) {
+          thinkingEscalations--;
+          effectiveThinking = retryThinkingConfig;
+        }
+        if (effectiveThinking) {
+          body.generationConfig = { ...(body.generationConfig ?? {}), thinkingConfig: effectiveThinking };
+        }
+        nextInit = { ...init, body: JSON.stringify(body) };
+      } catch {
+        // Non-JSON body — pass through untouched.
+      }
+      const res = await fetch(url, nextInit);
+      if (!res.ok) {
+        // Google's error body names the offending field/position, never
+        // conversation content — and without this a caller's content-free
+        // logging reduces every 4xx to an anonymous AI_APICallError.
+        let detail = '';
+        try {
+          detail = (await res.clone().text()).slice(0, 500);
+        } catch {
+          // Body unreadable — status alone still lands below.
+        }
+        console.warn('[honidev] google api error', { status: res.status, detail });
+      }
+      return res;
+    }) as unknown as typeof fetch;
+
+    const base = viaGateway(createGoogleGenerativeAI(opts)(modelId));
+    if (env.GOOGLE_RETRY_EMPTY === '1') {
+      if (!(globalThis as any).__honidevGoogleRetryLogged) {
+        (globalThis as any).__honidevGoogleRetryLogged = true;
+        console.warn('[honidev] google empty-stream retry ACTIVE');
+      }
+      return withEmptyStreamRetry(base, {
+        label: 'google',
+        escalated: !!retryThinkingConfig,
+        onRetry: () => {
+          if (retryThinkingConfig) thinkingEscalations++;
+        },
+      });
+    }
+    return base;
   }
 
   // ── Cloudflare Workers AI partner catalog ─────────────────────────────────
@@ -386,7 +714,149 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
     return viaGateway(mod.createAzure({ apiKey, baseURL: endpoint })(modelId.slice(6)));
   }
 
+  // ── OpenRouter ────────────────────────────────────────────────────────────
+  // Models: openrouter/anthropic/claude-haiku-4.5, openrouter/google/gemini-3.5-flash-lite,
+  // etc. — any OpenRouter catalogue id behind the `openrouter/` prefix, served
+  // over OpenRouter's OpenAI-compatible /chat/completions endpoint.
+  // Env:    OPENROUTER_API_KEY (required — no gateway placeholder: requests go
+  //         straight to openrouter.ai, so a missing key must fail loudly here
+  //         rather than as a per-turn 401), plus the optional
+  //         OPENROUTER_REASONING / OPENROUTER_REASONING_RETRY /
+  //         OPENROUTER_STRICT_TOOLS / OPENROUTER_RETRY_EMPTY knobs below.
+  if (modelId.startsWith('openrouter/')) {
+    const id = modelId.slice('openrouter/'.length);
+    const apiKey = env.OPENROUTER_API_KEY as string | undefined;
+    if (!apiKey) {
+      throw new Error('openrouter/* models require OPENROUTER_API_KEY in the Worker env.');
+    }
+
+    // One fetch wrapper for three OpenRouter quirks.
+    //
+    // OPENROUTER_REASONING (raw JSON, e.g. '{"effort":"minimal"}' or
+    // '{"enabled":false}') injects OpenRouter's `reasoning` body param — the
+    // knob that disables thinking on models honouring it (gemini-3.6-flash
+    // takes effort:minimal, qwen takes enabled:false).
+    //
+    // 429 responses (OpenRouter's new-account 10 req/min caps) are absorbed
+    // with header-aware backoff instead of surfacing as mid-turn stream
+    // deaths. The retry happens BEFORE any stream starts (a 429 arrives in
+    // place of the stream), so it is safe for streaming calls; the turn gets
+    // slower, never corrupted.
+    let reasoningConfig: unknown;
+    if (env.OPENROUTER_REASONING) {
+      try {
+        reasoningConfig = JSON.parse(env.OPENROUTER_REASONING as string);
+      } catch {
+        throw new Error(
+          'OPENROUTER_REASONING must be valid JSON (e.g. {"effort":"minimal"} or {"enabled":false}).',
+        );
+      }
+    }
+
+    // OPENROUTER_REASONING_RETRY: the reasoning config to use on an
+    // empty-stream RETRY only. gemini-3.5-flash-lite returns a deterministic
+    // empty completion (finish_reason 'error', zero tokens) on a
+    // request-correlated slice of requests at effort "minimal" — the same
+    // body succeeds at "low" (2026-08-20 captured-body A/B: minimal 6/6
+    // empty, low 0/6). Re-issuing at the same effort can never save those, so
+    // the retry escalates: the fast path keeps "minimal" TTFT, only the
+    // rescue pays for "low".
+    let retryReasoningConfig: unknown;
+    if (env.OPENROUTER_REASONING_RETRY) {
+      try {
+        retryReasoningConfig = JSON.parse(env.OPENROUTER_REASONING_RETRY as string);
+      } catch {
+        throw new Error('OPENROUTER_REASONING_RETRY must be valid JSON (e.g. {"effort":"low"}).');
+      }
+    }
+
+    // Pending escalations, consumed by the next outbound fetch. A counter
+    // rather than per-request plumbing because the AI-SDK fetch hook has no
+    // retry context; under concurrency a mis-attributed escalation only makes
+    // an unrelated request think harder — safe by design.
+    let reasoningEscalations = 0;
+
+    // OPENROUTER_STRICT_TOOLS=1 rewrites every tool's JSON schema into
+    // OpenAI's strict shape (gpt-5-family models REJECT tools otherwise:
+    // "'required' is required ... including every key in properties").
+    // Standard strict recipe: every property listed in `required`,
+    // previously-optional properties made nullable, additionalProperties
+    // false, strict: true on the function. Typeless union branches (Zod
+    // enum-or-passthrough) get a type inferred from enum/const members, else
+    // "any" becomes string — the caller's server-side validation stays
+    // canonical. Other providers don't need it: env-gated.
+    const strictTools = env.OPENROUTER_STRICT_TOOLS === '1';
+
+    const openrouterFetch = async (url: string, init?: RequestInit): Promise<Response> => {
+      let nextInit = init;
+      if (reasoningConfig || retryReasoningConfig || strictTools) {
+        try {
+          const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, any>;
+          let effectiveReasoning = reasoningConfig;
+          if (reasoningEscalations > 0 && retryReasoningConfig) {
+            reasoningEscalations--;
+            effectiveReasoning = retryReasoningConfig;
+          }
+          if (effectiveReasoning) body.reasoning = effectiveReasoning;
+          if (strictTools && Array.isArray(body.tools)) {
+            body.tools = body.tools.map((tool: any) =>
+              tool?.function?.parameters
+                ? {
+                    ...tool,
+                    function: {
+                      ...tool.function,
+                      strict: true,
+                      parameters: strictify(tool.function.parameters),
+                    },
+                  }
+                : tool,
+            );
+          }
+          nextInit = { ...init, body: JSON.stringify(body) };
+        } catch {
+          // non-JSON body: forward untouched
+        }
+      }
+      let response = await fetch(url, nextInit);
+      for (let attempt = 0; response.status === 429 && attempt < 5; attempt++) {
+        const resetAt = Number(response.headers.get('x-ratelimit-reset') ?? 0);
+        const waitMs = resetAt > 0 ? Math.min(Math.max(resetAt - Date.now(), 1000), 20000) : 7000;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        response = await fetch(url, nextInit);
+      }
+      return response;
+    };
+
+    const openrouter = createOpenAI({
+      baseURL: 'https://openrouter.ai/api/v1',
+      apiKey,
+      compatibility: 'compatible',
+      fetch: openrouterFetch as unknown as typeof fetch,
+      ...(headers ? { headers } : {}),
+    });
+
+    // OPENROUTER_RETRY_EMPTY='1': the bridge occasionally closes the SSE
+    // stream CLEANLY with zero output — no error thrown, the AI SDK
+    // synthesises finishReason 'unknown', the turn ends "done" and the caller
+    // gets silence with a bare unanswered user turn in memory.
+    const base = viaGateway(openrouter.chat(id));
+    if (env.OPENROUTER_RETRY_EMPTY === '1') {
+      if (!(globalThis as any).__honidevOrRetryLogged) {
+        (globalThis as any).__honidevOrRetryLogged = true;
+        console.warn('[honidev] openrouter empty-stream retry ACTIVE');
+      }
+      return withEmptyStreamRetry(base, {
+        label: 'openrouter',
+        escalated: !!retryReasoningConfig,
+        onRetry: () => {
+          if (retryReasoningConfig) reasoningEscalations++;
+        },
+      });
+    }
+    return base;
+  }
+
   throw new Error(
-    `Unsupported model: "${modelId}". Supported prefixes: claude-*, bedrock/*, gpt-*, gemini-*, @cf/*, google/*, anthropic/* (Workers AI partner catalog), groq/*, deepseek-*, mistral-*, grok-*, sonar*, together/*, command-*, azure/*`,
+    `Unsupported model: "${modelId}". Supported prefixes: claude-*, bedrock/*, gpt-*, gemini-*, @cf/*, google/*, anthropic/* (Workers AI partner catalog), openrouter/*, groq/*, deepseek-*, mistral-*, grok-*, sonar*, together/*, command-*, azure/*`,
   );
 }
