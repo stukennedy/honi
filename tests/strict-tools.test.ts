@@ -67,6 +67,35 @@ describe('strictify keeps optional arguments optional', () => {
   });
 });
 
+describe('strictify reaches shapes the property walk cannot', () => {
+  it('wraps an optional $ref/oneOf/allOf in a null union', () => {
+    for (const shape of [{ $ref: '#/$defs/Band' }, { oneOf: [{ type: 'string' }] }, { allOf: [{ type: 'string' }] }]) {
+      const out = strictify({ type: 'object', properties: { x: shape }, required: [] });
+      expect(out.required).toEqual(['x']);
+      // Neither omission nor null would be legal if this passed through.
+      expect(out.properties.x.anyOf?.[out.properties.x.anyOf.length - 1]).toEqual({ type: 'null' });
+    }
+  });
+
+  it('strictifies objects inside $defs and definitions', () => {
+    for (const key of ['$defs', 'definitions'] as const) {
+      const out = strictify({
+        type: 'object',
+        properties: { band: { $ref: `#/${key}/Band` } },
+        required: ['band'],
+        [key]: {
+          Band: { type: 'object', properties: { note: { type: 'string' } }, required: [] },
+        },
+      });
+      // Reachable only through $ref — the property walk never visits it, and a
+      // function marked strict:true is rejected if it stays unrewritten.
+      expect(out[key].Band.required).toEqual(['note']);
+      expect(out[key].Band.additionalProperties).toBe(false);
+      expect(out[key].Band.properties.note.type).toEqual(['string', 'null']);
+    }
+  });
+});
+
 describe('nullable', () => {
   it('is idempotent', () => {
     const once = nullable({ type: 'string', enum: ['a'] });
