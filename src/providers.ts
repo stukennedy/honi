@@ -167,6 +167,14 @@ export function withEmptyStreamRetry(
     doGenerate: (options: unknown) => m.doGenerate(options),
     doStream: async (options: unknown) => {
       const first = await m.doStream(options);
+      // Cancellation has to reach the PROVIDER. `start()` pumps eagerly, so a
+      // consumer that cancels the wrapper (a client disconnecting mid-turn)
+      // would otherwise leave the upstream fetch body locked and the model
+      // generating — and billing — until it finished on its own. Consuming the
+      // provider stream directly does not have this problem; wrapping it
+      // introduces it, so the wrapper has to hand cancellation back.
+      let activeReader: ReadableStreamDefaultReader<unknown> | undefined;
+      let cancelled = false;
       const stream = new ReadableStream({
         async start(controller) {
           // Diagnostics per attempt: the upstream finishReason (the AI SDK
@@ -174,6 +182,7 @@ export function withEmptyStreamRetry(
           // reason is visible) plus what part types the empty stream carried.
           const pump = async (attempt: { stream: ReadableStream }) => {
             const reader = attempt.stream.getReader();
+            activeReader = reader;
             let sawContent = false;
             let finishReason: unknown = null;
             let providerError: string | null = null;
@@ -202,6 +211,8 @@ export function withEmptyStreamRetry(
               }
             } catch (err) {
               failure = err;
+            } finally {
+              activeReader = undefined;
             }
             return { sawContent, held, finishReason, providerError, partTypes, failure };
           };
@@ -220,6 +231,9 @@ export function withEmptyStreamRetry(
             return;
           }
           for (let attempt = 1; !last.sawContent && attempt <= MAX_RETRIES; attempt++) {
+            // A cancelled stream reads as "no content"; retrying it would open
+            // a fresh upstream request for a consumer that has already gone.
+            if (cancelled) return;
             console.warn(`[honidev] ${opts.label} empty stream — retrying`, {
               modelId: m.modelId,
               attempt,
@@ -237,6 +251,15 @@ export function withEmptyStreamRetry(
               break;
             }
             if (!next) break;
+            // RE-CHECK: cancellation can arrive during the await above, when
+            // there is no active reader for cancel() to reach. Pumping on
+            // regardless would leave the stream we just opened generating —
+            // and billing — for a consumer that has already gone, which is the
+            // exact leak this guard exists to close.
+            if (cancelled) {
+              await next.stream.cancel('cancelled').catch(() => undefined);
+              return;
+            }
             const result = await pump(next);
             if (result.failure) {
               // Anything this attempt forwarded is ALREADY downstream. Closing
@@ -253,6 +276,7 @@ export function withEmptyStreamRetry(
             }
             last = result;
           }
+          if (cancelled) return;
           if (!last.sawContent) {
             console.warn(`[honidev] ${opts.label} empty stream — giving up`, {
               modelId: m.modelId,
@@ -262,6 +286,10 @@ export function withEmptyStreamRetry(
             for (const h of last.held) controller.enqueue(h);
           }
           controller.close();
+        },
+        async cancel(reason) {
+          cancelled = true;
+          await activeReader?.cancel(reason);
         },
       });
       return { ...first, stream };
@@ -303,7 +331,11 @@ export function nullable(schema: any): any {
   }
   if (schema.type !== undefined) return { ...schema, type: widenType(schema.type) };
   if (Array.isArray(schema.anyOf)) return { ...schema, anyOf: [...schema.anyOf, { type: 'null' }] };
-  return schema;
+  // $ref / oneOf / allOf cannot be widened in place either. Passing them
+  // through unchanged would be the same trap as the enum case: strict mode
+  // still moves the key into `required`, so the argument could be neither
+  // omitted nor null and an optional one has quietly become mandatory.
+  return { anyOf: [schema, { type: 'null' }] };
 }
 export function strictify(schema: any): any {
   if (schema === null || typeof schema !== 'object') return schema;
@@ -324,6 +356,18 @@ export function strictify(schema: any): any {
   if (out.items) out.items = strictify(out.items);
   for (const key of ['anyOf', 'oneOf', 'allOf']) {
     if (Array.isArray(out[key])) out[key] = out[key].map(strictify);
+  }
+  // Reusable and recursive schemas live in $defs/definitions and are reached
+  // only through $ref, so the property walk above never visits them. Left
+  // alone they keep their missing `required` and additionalProperties, and a
+  // function marked strict: true is rejected before generation.
+  for (const key of ['$defs', 'definitions']) {
+    const defs = out[key];
+    if (defs && typeof defs === 'object' && !Array.isArray(defs)) {
+      out[key] = Object.fromEntries(
+        Object.entries(defs).map(([name, value]) => [name, strictify(value)]),
+      );
+    }
   }
   if (out.type === undefined && !out.$ref && !out.anyOf && !out.oneOf && !out.allOf) {
     if (Array.isArray(out.enum) && out.enum.length > 0) {

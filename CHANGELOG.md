@@ -57,6 +57,22 @@ home, types and tests.
   `DataCloneError` at the consumer's `read()`. Errors are now probed for
   clonability and flattened ONLY when they cannot survive, so ordinary errors
   keep their class — a consumer catching `TypeError`/`RangeError` still gets one.
+- **Cancellation reaches the provider.** With an empty-stream retry enabled the
+  wrapper pumps eagerly in `start()`, so a consumer that cancelled — a client
+  disconnecting mid-turn — left the upstream body locked and the model
+  generating, and billing, until it finished on its own. Cancellation now
+  propagates to the active reader; a cancelled stream never opens a retry (it
+  reads as "no content", which would otherwise fire a fresh request for a
+  consumer that has already gone); and a cancellation that lands DURING the
+  network wait to open a retry — when there is no active reader to cancel —
+  disposes of the stream it just opened instead of pumping it.
+- **`OPENROUTER_STRICT_TOOLS` handles `$ref`/`oneOf`/`allOf` and `$defs`.**
+  Optional properties of those shapes fell through the nullable conversion
+  unchanged while still being moved into `required` — the same
+  optional-becomes-mandatory trap as the enum case — and objects inside
+  `$defs`/`definitions`, reachable only through `$ref`, were never rewritten at
+  all, so a function marked `strict: true` was rejected before generation.
+
 - **An empty-stream retry that starts emitting and then dies no longer closes
   cleanly.** Its parts are already downstream, so reporting success handed the
   consumer a truncated turn — and the give-up path then appended the FIRST
