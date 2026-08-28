@@ -57,6 +57,18 @@ home, types and tests.
   `DataCloneError` at the consumer's `read()`. Errors are now probed for
   clonability and flattened ONLY when they cannot survive, so ordinary errors
   keep their class — a consumer catching `TypeError`/`RangeError` still gets one.
+- **An empty-stream retry that starts emitting and then dies no longer closes
+  cleanly.** Its parts are already downstream, so reporting success handed the
+  consumer a truncated turn — and the give-up path then appended the FIRST
+  attempt's held parts on top of them. The failure now propagates; a retry that
+  dies before emitting anything still degrades to the documented give-up.
+- **`OPENROUTER_STRICT_TOOLS` keeps optional enum/const arguments optional.**
+  Strict mode moves every property into `required`, so an optional one survives
+  only if the rewrite genuinely admits null — and a value must satisfy `type`
+  AND `enum`/`const`, so widening `type` alone did not. Optional enums now gain
+  a `null` member and optional consts become a union, instead of silently
+  turning into mandatory arguments.
+
 - **`gemini-*` without `GOOGLE_AI_API_KEY` fails at resolve**, naming the
   variable, instead of surfacing as an anonymous per-turn 401/403. Google 4xx
   bodies (which name the offending field, never conversation content) are

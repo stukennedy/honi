@@ -147,7 +147,7 @@ function resolveApiKey(
  * only — the fast path keeps its low-latency setting, and only a retry pays
  * for the more expensive one.
  */
-function withEmptyStreamRetry(
+export function withEmptyStreamRetry(
   model: LanguageModel,
   opts: { label: string; escalated: boolean; onRetry?: () => void },
 ): LanguageModel {
@@ -179,23 +179,31 @@ function withEmptyStreamRetry(
             let providerError: string | null = null;
             const partTypes: Record<string, number> = {};
             const held: unknown[] = [];
-            for (;;) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              const part = value as StreamPart;
-              const t = part?.type ?? 'unknown';
-              partTypes[t] = (partTypes[t] ?? 0) + 1;
-              if (t === 'finish' && part.finishReason) finishReason = part.finishReason;
-              if (t === 'error') providerError = String(part.error ?? 'unknown');
-              if (!sawContent && isContent(part)) {
-                sawContent = true;
-                for (const h of held) controller.enqueue(h);
-                held.length = 0;
+            // Captured rather than thrown: the caller has to know whether THIS
+            // attempt already forwarded parts downstream before it died, and a
+            // throw loses that with the rest of the state.
+            let failure: unknown;
+            try {
+              for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const part = value as StreamPart;
+                const t = part?.type ?? 'unknown';
+                partTypes[t] = (partTypes[t] ?? 0) + 1;
+                if (t === 'finish' && part.finishReason) finishReason = part.finishReason;
+                if (t === 'error') providerError = String(part.error ?? 'unknown');
+                if (!sawContent && isContent(part)) {
+                  sawContent = true;
+                  for (const h of held) controller.enqueue(h);
+                  held.length = 0;
+                }
+                if (sawContent) controller.enqueue(value);
+                else held.push(value);
               }
-              if (sawContent) controller.enqueue(value);
-              else held.push(value);
+            } catch (err) {
+              failure = err;
             }
-            return { sawContent, held, finishReason, providerError, partTypes };
+            return { sawContent, held, finishReason, providerError, partTypes, failure };
           };
           const emptyDiagnostics = (last: Awaited<ReturnType<typeof pump>>) => ({
             finishReason: last.finishReason,
@@ -204,6 +212,13 @@ function withEmptyStreamRetry(
           });
           const MAX_RETRIES = 2;
           let last = await pump(first);
+          // A first attempt that dies mid-stream is a genuine failure, not the
+          // clean zero-output close this wrapper exists to rescue — surface it
+          // exactly as an unwrapped model would.
+          if (last.failure) {
+            controller.error(last.failure);
+            return;
+          }
           for (let attempt = 1; !last.sawContent && attempt <= MAX_RETRIES; attempt++) {
             console.warn(`[honidev] ${opts.label} empty stream — retrying`, {
               modelId: m.modelId,
@@ -212,13 +227,31 @@ function withEmptyStreamRetry(
               escalated: opts.escalated,
               ...emptyDiagnostics(last),
             });
+            let next: { stream: ReadableStream } | undefined;
             try {
               opts.onRetry?.();
-              const next = await m.doStream(options);
-              last = await pump(next);
+              next = await m.doStream(options);
             } catch {
+              // Could not even open a retry — degrade to giving up below,
+              // which is the behaviour a caller had before this wrapper.
               break;
             }
+            if (!next) break;
+            const result = await pump(next);
+            if (result.failure) {
+              // Anything this attempt forwarded is ALREADY downstream. Closing
+              // cleanly would hand the consumer a truncated turn labelled
+              // success, and appending the first attempt's held parts on top of
+              // it would corrupt the stream outright.
+              if (result.sawContent) {
+                controller.error(result.failure);
+                return;
+              }
+              // Nothing was forwarded, so `last` is still the empty first
+              // attempt and the give-up path below stays correct.
+              break;
+            }
+            last = result;
           }
           if (!last.sawContent) {
             console.warn(`[honidev] ${opts.label} empty stream — giving up`, {
@@ -234,6 +267,75 @@ function withEmptyStreamRetry(
       return { ...first, stream };
     },
   } as unknown as LanguageModel;
+}
+
+/**
+ * JSON-schema helpers for OPENROUTER_STRICT_TOOLS. Module scope (not exported
+ * from index.ts, so not public API) purely so they are reachable from tests —
+ * both are pure, and both encode rules that are easy to get subtly wrong.
+ */
+// Widen a schema to admit null. `type` alone is NOT enough: a value has to
+// satisfy `type` AND `enum`/`const`, so `{type:['string','null'], enum:[…]}`
+// still rejects null — and since strict mode also moves the key into
+// `required`, both omission and null would be invalid and an OPTIONAL tool
+// argument would have silently become mandatory.
+export function nullable(schema: any): any {
+  if (schema === null || typeof schema !== 'object') return schema;
+  const widenType = (type: unknown): unknown => {
+    if (typeof type === 'string') return [type, 'null'];
+    if (Array.isArray(type)) return type.includes('null') ? type : [...type, 'null'];
+    return type;
+  };
+  if (Array.isArray(schema.enum)) {
+    return {
+      ...schema,
+      enum: schema.enum.includes(null) ? schema.enum : [...schema.enum, null],
+      ...(schema.type === undefined ? {} : { type: widenType(schema.type) }),
+    };
+  }
+  if (schema.const !== undefined) {
+    // A const cannot be widened in place — the branch has to become a union.
+    const { const: constValue, type, ...rest } = schema;
+    return {
+      ...rest,
+      anyOf: [{ const: constValue, ...(type === undefined ? {} : { type }) }, { type: 'null' }],
+    };
+  }
+  if (schema.type !== undefined) return { ...schema, type: widenType(schema.type) };
+  if (Array.isArray(schema.anyOf)) return { ...schema, anyOf: [...schema.anyOf, { type: 'null' }] };
+  return schema;
+}
+export function strictify(schema: any): any {
+  if (schema === null || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) return schema.map(strictify);
+  const out: Record<string, any> = { ...schema };
+  if (out.type === 'object' && out.properties && typeof out.properties === 'object') {
+    const originallyRequired = new Set<string>(Array.isArray(out.required) ? out.required : []);
+    const props: Record<string, any> = {};
+    for (const [key, value] of Object.entries(out.properties)) {
+      let next = strictify(value);
+      if (!originallyRequired.has(key)) next = nullable(next);
+      props[key] = next;
+    }
+    out.properties = props;
+    out.required = Object.keys(props);
+    out.additionalProperties = false;
+  }
+  if (out.items) out.items = strictify(out.items);
+  for (const key of ['anyOf', 'oneOf', 'allOf']) {
+    if (Array.isArray(out[key])) out[key] = out[key].map(strictify);
+  }
+  if (out.type === undefined && !out.$ref && !out.anyOf && !out.oneOf && !out.allOf) {
+    if (Array.isArray(out.enum) && out.enum.length > 0) {
+      const kinds = [...new Set(out.enum.map((v: unknown) => (v === null ? 'null' : typeof v)))];
+      out.type = kinds.length === 1 ? kinds[0] : kinds;
+    } else if (out.const !== undefined) {
+      out.type = out.const === null ? 'null' : typeof out.const;
+    } else {
+      out.type = 'string';
+    }
+  }
+  return out;
 }
 
 export async function resolveModel(modelId: string, options?: ProviderOptions): Promise<LanguageModel> {
@@ -334,12 +436,18 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
     if (gatewayUrl) opts.baseURL = gatewayUrl;
     if (headers) opts.headers = headers;
     const apiKey = resolveApiKey(env, 'GOOGLE_AI_API_KEY', gateway);
-    if (!apiKey) {
+    // Loud only on the DIRECT route. With no key the request goes straight to
+    // generativelanguage.googleapis.com and can only fail as a per-turn
+    // 401/403, so the missing variable should be named here instead. But the
+    // deprecated `gatewayUrl` override (with `headers` for proxy auth) is a
+    // documented keyless path — a proxy or gateway holds the credential — and
+    // throwing on it would break callers who never had a Google key at all.
+    if (!apiKey && !gatewayUrl) {
       throw new Error(
-        'gemini-* models require GOOGLE_AI_API_KEY in the Worker env (or an AI Gateway with stored keys).',
+        'gemini-* models require GOOGLE_AI_API_KEY in the Worker env (or an AI Gateway with stored keys, or a gatewayUrl proxy that supplies them).',
       );
     }
-    opts.apiKey = apiKey;
+    if (apiKey) opts.apiKey = apiKey;
 
     // GOOGLE_THINKING_CONFIG (raw JSON, e.g. '{"thinkingLevel":"minimal"}' or
     // '{"thinkingBudget":0}') injects the Gemini API's
@@ -678,43 +786,6 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
     // "any" becomes string — the caller's server-side validation stays
     // canonical. Other providers don't need it: env-gated.
     const strictTools = env.OPENROUTER_STRICT_TOOLS === '1';
-    const strictify = (schema: any): any => {
-      if (schema === null || typeof schema !== 'object') return schema;
-      if (Array.isArray(schema)) return schema.map(strictify);
-      const out: Record<string, any> = { ...schema };
-      if (out.type === 'object' && out.properties && typeof out.properties === 'object') {
-        const originallyRequired = new Set<string>(Array.isArray(out.required) ? out.required : []);
-        const props: Record<string, any> = {};
-        for (const [key, value] of Object.entries(out.properties)) {
-          let next = strictify(value);
-          if (!originallyRequired.has(key)) {
-            if (typeof next.type === 'string') next = { ...next, type: [next.type, 'null'] };
-            else if (Array.isArray(next.type) && !next.type.includes('null'))
-              next = { ...next, type: [...next.type, 'null'] };
-            else if (next.anyOf) next = { ...next, anyOf: [...next.anyOf, { type: 'null' }] };
-          }
-          props[key] = next;
-        }
-        out.properties = props;
-        out.required = Object.keys(props);
-        out.additionalProperties = false;
-      }
-      if (out.items) out.items = strictify(out.items);
-      for (const key of ['anyOf', 'oneOf', 'allOf']) {
-        if (Array.isArray(out[key])) out[key] = out[key].map(strictify);
-      }
-      if (out.type === undefined && !out.$ref && !out.anyOf && !out.oneOf && !out.allOf) {
-        if (Array.isArray(out.enum) && out.enum.length > 0) {
-          const kinds = [...new Set(out.enum.map((v: unknown) => (v === null ? 'null' : typeof v)))];
-          out.type = kinds.length === 1 ? kinds[0] : kinds;
-        } else if (out.const !== undefined) {
-          out.type = out.const === null ? 'null' : typeof out.const;
-        } else {
-          out.type = 'string';
-        }
-      }
-      return out;
-    };
 
     const openrouterFetch = async (url: string, init?: RequestInit): Promise<Response> => {
       let nextInit = init;
