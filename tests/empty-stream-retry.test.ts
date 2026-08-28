@@ -174,6 +174,42 @@ describe('withEmptyStreamRetry', () => {
     expect(opened).toBe(1);
   });
 
+  it('cancels a retry stream that was opened while the consumer disconnected', async () => {
+    // The narrow window: cancellation lands DURING `await doStream()`, when
+    // there is no active reader for cancel() to reach. Without the re-check
+    // the wrapper pumps the stream it just opened for nobody.
+    const endless = endlessAttempt();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let opened = 0;
+    const model = {
+      specificationVersion: 'v1',
+      provider: 'test',
+      modelId: 'test-model',
+      doGenerate: async () => ({}),
+      doStream: async () => {
+        opened++;
+        if (opened === 1) return attempt(EMPTY);
+        await gate;
+        return endless.attempt;
+      },
+    } as any;
+
+    const wrapped = withEmptyStreamRetry(model, { label: 'test', escalated: false }) as any;
+    const stream = (await wrapped.doStream({})).stream as ReadableStream;
+    // start() pumps eagerly, so it is already parked on the gate.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(opened).toBe(2);
+
+    await stream.cancel('client disconnected');
+    release();
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(endless.state.cancelled).toBe(true);
+  });
+
   it('calls onRetry once per retry so a caller can escalate a provider knob', async () => {
     let escalations = 0;
     const model = fakeModel([() => attempt(EMPTY), () => attempt(EMPTY), () => attempt(TEXT)]);

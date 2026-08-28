@@ -61,9 +61,11 @@ home, types and tests.
   wrapper pumps eagerly in `start()`, so a consumer that cancelled — a client
   disconnecting mid-turn — left the upstream body locked and the model
   generating, and billing, until it finished on its own. Cancellation now
-  propagates to the active reader, and a cancelled stream never opens a retry
-  (it reads as "no content", which would otherwise fire a fresh request for a
-  consumer that has already gone).
+  propagates to the active reader; a cancelled stream never opens a retry (it
+  reads as "no content", which would otherwise fire a fresh request for a
+  consumer that has already gone); and a cancellation that lands DURING the
+  network wait to open a retry — when there is no active reader to cancel —
+  disposes of the stream it just opened instead of pumping it.
 - **`OPENROUTER_STRICT_TOOLS` handles `$ref`/`oneOf`/`allOf` and `$defs`.**
   Optional properties of those shapes fell through the nullable conversion
   unchanged while still being moved into `required` — the same

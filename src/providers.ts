@@ -251,6 +251,15 @@ export function withEmptyStreamRetry(
               break;
             }
             if (!next) break;
+            // RE-CHECK: cancellation can arrive during the await above, when
+            // there is no active reader for cancel() to reach. Pumping on
+            // regardless would leave the stream we just opened generating —
+            // and billing — for a consumer that has already gone, which is the
+            // exact leak this guard exists to close.
+            if (cancelled) {
+              await next.stream.cancel('cancelled').catch(() => undefined);
+              return;
+            }
             const result = await pump(next);
             if (result.failure) {
               // Anything this attempt forwarded is ALREADY downstream. Closing
