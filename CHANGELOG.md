@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.8.5 — 2026-08-28
+
+Folds in behaviour that had been living as a downstream `dist/` patch
+(`patches/honidev@0.8.4.patch`, applied via bun `patchedDependencies` in the
+consuming monorepo). Patching built output cannot survive a release and is
+invisible to this repo's tests: a surface that moved out of the monorepo lost
+the patch silently and only found out from three failing guard tests. Nothing
+below is new behaviour for those consumers — it is the same code, now with a
+home, types and tests.
+
+### Added
+
+- **`openrouter/*` models.** Any OpenRouter catalogue id behind the prefix
+  (`openrouter/anthropic/claude-haiku-4.5`, …), served over OpenRouter's
+  OpenAI-compatible endpoint. Requires `OPENROUTER_API_KEY`.
+  - `OPENROUTER_REASONING` (raw JSON) injects OpenRouter's `reasoning` body
+    param — the knob that disables thinking on models honouring it
+    (`{"effort":"minimal"}` for gemini-3.6-flash, `{"enabled":false}` for qwen).
+  - `OPENROUTER_REASONING_RETRY` escalates that config on an empty-stream retry
+    only, so the fast path keeps its TTFT and only the rescue pays.
+  - `OPENROUTER_STRICT_TOOLS=1` rewrites tool schemas into OpenAI's strict
+    shape — gpt-5-family models reject tools otherwise.
+  - `OPENROUTER_RETRY_EMPTY=1` re-issues a stream that closed cleanly with zero
+    output.
+  - 429s (OpenRouter's new-account rate caps) are absorbed with header-aware
+    backoff before any stream starts, so a turn gets slower rather than dying
+    mid-stream.
+- **`GOOGLE_THINKING_CONFIG` / `GOOGLE_THINKING_CONFIG_RETRY`** inject
+  `generationConfig.thinkingConfig` into every Gemini request. This cannot go
+  through `modelSettings.providerOptions`: `@ai-sdk/google`'s provider-options
+  schema admits only `thinkingBudget`/`includeThoughts` and silently strips
+  unknown keys, so `thinkingLevel` (the 3.x control) can only reach the wire
+  here. Malformed JSON throws at resolve rather than on the wire.
+- **`GOOGLE_RETRY_EMPTY=1`** — the same empty-stream retry for the Google
+  direct API, where `gemini-3.5-flash-lite` at `thinkingLevel: minimal`
+  intermittently returns `MALFORMED_RESPONSE` with zero output.
+
+### Fixed
+
+- **Gemini 3.x post-tool-call turns no longer 400.** The API rejects any
+  history `functionCall` part without a `thoughtSignature`, and `@ai-sdk/google`
+  predates signatures entirely (strips them from responses, never replays
+  them). Google's documented bypass sentinel is now injected into
+  signature-less parts, so the wrapper is installed on every `gemini-*` model
+  regardless of thinking config.
+- **`ThreadMemory.append` survives unclonable decoration.** DO storage uses the
+  v8 structured-clone serializer, which throws on functions — seen live as
+  `DataCloneError` at `working_memory.save` when a `ZodError` (carrying its own
+  issue-pusher closure) rode an invalid-tool-args marker into a tool call's
+  args. Messages are provider-wire JSON semantically, so a round-trip before
+  `put` is lossless for real content and drops only the unclonable decoration
+  instead of killing the turn.
+- **A failing stream no longer masks its own cause.** The error crosses the
+  DO → Worker boundary and is structured-cloned; a rich error graph throws
+  `DataCloneError` at the consumer's `read()`. Errors are now probed for
+  clonability and flattened ONLY when they cannot survive, so ordinary errors
+  keep their class — a consumer catching `TypeError`/`RangeError` still gets one.
+- **`gemini-*` without `GOOGLE_AI_API_KEY` fails at resolve**, naming the
+  variable, instead of surfacing as an anonymous per-turn 401/403. Google 4xx
+  bodies (which name the offending field, never conversation content) are
+  logged, so a caller's content-free logging no longer reduces every failure to
+  an opaque `AI_APICallError`.
+
 ## 0.8.4 — 2026-08-13
 
 ### Fixed

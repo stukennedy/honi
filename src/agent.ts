@@ -111,6 +111,24 @@ export function buildAgentStreamOptions<TOOLS extends ToolSet>(input: {
   };
 }
 
+/**
+ * Return an error safe to hand to `controller.error()` across a structured-clone
+ * boundary. The original is preserved whenever it can be cloned; only an
+ * unclonable one (functions or other non-serialisable values hanging off the
+ * instance) is flattened to a plain Error carrying the same name and message.
+ */
+function toClonableError(error: unknown): unknown {
+  try {
+    structuredClone(error);
+    return error;
+  } catch {
+    const reason = error instanceof Error ? error : new Error(String(error));
+    const safe = new Error(reason.message);
+    safe.name = reason.name;
+    return safe;
+  }
+}
+
 export function createAgent(config: AgentConfig) {
   const binding = config.binding ?? 'AGENT';
   const maxSteps = config.maxSteps ?? 10;
@@ -675,7 +693,18 @@ export function createAgent(config: AgentConfig) {
               }
             } catch (error) {
               emitTerminal(error);
-              controller.error(error);
+              // The error crosses the DO -> Worker fetch boundary, where workerd
+              // structured-clones it. A rich error graph throws DataCloneError
+              // at the consumer's read() and masks the real failure — observed
+              // live with a ZodError carrying its issue-pusher closure
+              // `(sub) => { this.issues = [...] }` as an own property.
+              //
+              // Only DEGRADE when we have to: probe clonability first and pass
+              // the original through when it survives, so ordinary errors keep
+              // their class (a consumer catching TypeError/RangeError still
+              // sees one). Errors are exceptional, so the probe costs nothing
+              // on the happy path.
+              controller.error(toClonableError(error));
             }
           },
           async cancel(reason) {
