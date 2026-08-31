@@ -24,6 +24,37 @@ export interface AgentResponse {
 }
 
 /**
+ * Extract the assistant text from an AI SDK UI message stream (SSE) body —
+ * the `/chat` wire format since 0.9.0 (previously the v4 data protocol's
+ * `0:` frames). Text rides `text-delta` chunks; an `error` chunk means the
+ * turn FAILED (honidev withholds the finish frame on failure), so it throws
+ * rather than returning whatever partial text streamed before the failure
+ * as if it were the answer.
+ */
+export function parseUiMessageStreamText(body: string): string {
+  let text = '';
+  for (const line of body.split('\n')) {
+    if (!line.startsWith('data: ')) continue;
+    const payload = line.slice('data: '.length).trim();
+    if (payload === '[DONE]') break;
+    let chunk: { type?: string; delta?: unknown; errorText?: unknown };
+    try {
+      chunk = JSON.parse(payload) as typeof chunk;
+    } catch {
+      continue;
+    }
+    if (chunk.type === 'text-delta' && typeof chunk.delta === 'string') {
+      text += chunk.delta;
+    } else if (chunk.type === 'error') {
+      throw new Error(
+        typeof chunk.errorText === 'string' ? chunk.errorText : 'Agent turn failed.',
+      );
+    }
+  }
+  return text;
+}
+
+/**
  * Route a chat message to another agent.
  * Returns the full response (non-streaming).
  */
@@ -54,11 +85,9 @@ export async function routeToAgent(
     throw new Error(`Agent request failed: ${response.status}`);
   }
 
-  // Parse streaming response to get final message
-  const text = await response.text();
-  const lines = text.split('\n').filter(l => l.startsWith('0:'));
-  const fullResponse = lines.map(l => JSON.parse(l.slice(2))).join('');
-  
+  // Parse the streamed response to get the final message
+  const fullResponse = parseUiMessageStreamText(await response.text());
+
   return {
     messages: [
       { role: 'user', content: message },
