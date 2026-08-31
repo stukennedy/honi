@@ -74,6 +74,24 @@ describe('ThreadMemory tolerates unclonable decoration on messages', () => {
     expect([...loaded[0].content[0].data]).toEqual([...bytes]);
   });
 
+  it('preserves Buffer-backed part data (toJSON runs before the replacer)', async () => {
+    // Buffer serializes ITSELF to {type:'Buffer',data:[...]} before any
+    // replacer runs; the replacer must detect binary on the holder's
+    // original value, not the toJSON output.
+    const memory = new ThreadMemory(createMockStorage());
+    const bytes = Buffer.from([9, 8, 7, 6]);
+    await memory.append([
+      {
+        role: 'user',
+        content: [{ type: 'file', mediaType: 'application/pdf', data: bytes }],
+      } as any,
+    ]);
+
+    const loaded = (await memory.load()) as any[];
+    expect(loaded[0].content[0].data).toBeInstanceOf(Uint8Array);
+    expect([...loaded[0].content[0].data]).toEqual([9, 8, 7, 6]);
+  });
+
   it('leaves envelope-shaped application data alone', async () => {
     // Tool args are arbitrary JSON — data that mimics the internal binary
     // envelope must survive the round-trip as the same object.
