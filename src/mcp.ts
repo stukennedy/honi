@@ -101,7 +101,7 @@ export function createMcpServer(tools: ToolDefinition[]) {
               },
               serverInfo: {
                 name: 'honi-agent',
-                version: '0.4.0',
+                version: '1.0.0',
               },
             },
           };

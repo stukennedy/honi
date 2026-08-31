@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.0.0 — 2026-08-31
+
+The 1.0 milestone: 0.9.0's AI SDK 7 migration, hardened by two review
+passes (eight rounds of Codex on the PRs, plus an external full-library
+review) — every finding verified against the code, every fix pinned by a
+regression test. 173 tests.
+
+### Fixed
+
+- **`EpisodicMemory.load` returned the OLDEST `limit` rows.** Once a thread
+  outgrew the limit the context window froze on its first 50 messages
+  forever — a bug that gets worse the longer a thread runs. Load now selects
+  the newest N and replays them chronologically, verified with real-SQL
+  tests over `bun:sqlite`.
+- **A fresh D1 binding no longer throws "no such table".** `init()` existed
+  but nothing ever called it; every episodic data path now ensures the
+  schema lazily (memoized per instance, failed attempts retried). `init()`
+  also runs each DDL statement via `prepare()` — D1's `exec()` rejects the
+  pretty-printed multi-line SQL the dead code carried.
+- **`routeToAgent` parses the UI message stream.** It still read the AI SDK
+  v4 data protocol's `0:` frames, so every routed agent-to-agent response
+  came back empty. The new exported `parseUiMessageStreamText` helper
+  accumulates `text-delta` SSE chunks and throws on an `error` frame rather
+  than returning a failed turn's partial text as the answer.
+- **Episodic (D1) history round-trips STRUCTURED content.** Parts arrays
+  were persisted as JSON but loaded back as plain text: the model saw its
+  own previous answer as literal `[{"type":"text",...}]`, tool rows degraded
+  to `user` messages, and Gemini thought signatures were lost through
+  D1-backed threads. Structured rows are now explicitly marker-encoded
+  (`honi::parts::`/`honi::text::`, collision-escaped) — never inferred from
+  shape for new writes; legacy bare-JSON rows decode by shape only for the
+  roles 0.8.x actually persisted structurally (assistant/tool, known part
+  types only), so user text that merely looks like parts stays text.
+- **Binary part data survives persistence.** `JSON.stringify` mangles
+  `Uint8Array`/`ArrayBuffer` (and `Buffer`, whose `toJSON` runs before any
+  replacer) into malformed objects; a shared base64 envelope now carries
+  binary losslessly through BOTH persistence paths (episodic's TEXT column
+  and `ThreadMemory`'s clone-safety round-trip), with sentinel-shaped
+  application data escaped rather than misrevived.
+- **Corrupt marker rows degrade cleanly** to their JSON text without leaking
+  the encoding prefix into model-visible content.
+
+### Security
+
+- **`GET /mcp/tools` now honours the MCP bearer secret** — tool names,
+  descriptions, and schemas map the agent's capabilities and were served
+  unauthenticated. The token comparison is constant-time.
+
 ## 0.9.0 — 2026-08-31
 
 Migrates from AI SDK 4 to AI SDK 7 (`ai@^7`, provider packages at their
