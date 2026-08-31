@@ -306,10 +306,18 @@ describe('EpisodicMemory against real SQL (bun:sqlite)', () => {
   });
 });
 
-describe('corrupt marker rows', () => {
-  it('degrades to the JSON text without leaking the encoding prefix', async () => {
-    const { db } = fakeD1([{ role: 'assistant', content: 'honi::parts::{not json' }]);
+describe('marker-prefixed rows that are not ours', () => {
+  it('preserves unparseable marker-prefixed text byte-for-byte', async () => {
+    // A parts row this encoding wrote always parses; one that doesn't is
+    // pre-marker text or corruption. Content that cannot be positively
+    // identified as ours must never be altered — integrity over hiding the
+    // scheme's name from the model.
+    const { db } = fakeD1([
+      { role: 'assistant', content: 'honi::parts::{not json' },
+      { role: 'user', content: 'honi::parts::hello from a legacy row' },
+    ]);
     const loaded = await new EpisodicMemory(db).load('agent', 'thread');
-    expect(loaded[0]).toEqual({ role: 'assistant', content: '{not json' });
+    expect(loaded[0]).toEqual({ role: 'assistant', content: 'honi::parts::{not json' });
+    expect(loaded[1]).toEqual({ role: 'user', content: 'honi::parts::hello from a legacy row' });
   });
 });

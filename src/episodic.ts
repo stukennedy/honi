@@ -92,9 +92,12 @@ function parseStructuredContent(
         Record<string, unknown>
       >;
     } catch {
-      // Corrupt marker row: degrade to its JSON text, WITHOUT the prefix —
-      // the model has no use for the internal encoding scheme's name.
-      return raw.slice(PARTS_MARKER.length);
+      // A parts row WE wrote always carries valid JSON, and encodeContent
+      // escapes any plain string that starts with a marker — so a
+      // marker-prefixed row that does NOT parse is provably not ours
+      // (pre-marker text, or corruption). Never alter content that cannot be
+      // positively identified as this encoding: return it byte-for-byte.
+      return raw;
     }
   }
   if (raw.startsWith(TEXT_MARKER)) return raw.slice(TEXT_MARKER.length);
