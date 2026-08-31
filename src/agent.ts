@@ -1,8 +1,12 @@
 import { Hono } from 'hono';
 import {
+  createUIMessageStreamResponse,
+  isStepCount,
   streamText,
-  type CoreMessage,
+  toUIMessageStream,
+  type ModelMessage,
   type LanguageModel,
+  type SystemModelMessage,
   type ToolCallRepairFunction,
   type ToolSet,
 } from 'ai';
@@ -39,24 +43,24 @@ function resolveCache(cache: AgentConfig['cache']): {
 /**
  * Assemble a turn's prompt, placing Anthropic cache breakpoints when asked.
  *
- * Returns `system` separately from `messages` because the two are mutually
- * exclusive: caching the system prompt REQUIRES carrying it as a message (the
- * provider reads cache control off `providerOptions`, and a top-level `system`
- * string has nowhere to put it), while leaving caching off must reproduce the
- * previous shape byte-for-byte. `system: undefined` means "it's in `messages`".
+ * `system` is returned separately from `messages` and feeds the model call's
+ * `instructions` option (the AI SDK rejects system messages inside `messages`
+ * by default). Caching the system prompt upgrades it from a plain string to a
+ * full system message: the provider reads cache control off `providerOptions`,
+ * which a bare string has nowhere to carry.
  *
  * Exported for tests — the placement of breakpoints is the whole behaviour, and
  * it is worth asserting without standing up a Durable Object.
  */
 export function buildPrompt(input: {
   systemPrompt: string;
-  history: CoreMessage[];
+  history: ModelMessage[];
   message: string;
   cache: AgentConfig['cache'];
-}): { messages: CoreMessage[]; system: string | undefined } {
+}): { messages: ModelMessage[]; system: string | SystemModelMessage | undefined } {
   const cache = resolveCache(input.cache);
 
-  const turn: CoreMessage[] = [...input.history, { role: 'user' as const, content: input.message }];
+  const turn: ModelMessage[] = [...input.history, { role: 'user' as const, content: input.message }];
 
   // Breakpoint 2 — the conversation prefix up to, but NOT including, this
   // turn's user message. Marking the last message of `history` is what makes
@@ -68,22 +72,19 @@ export function buildPrompt(input: {
     turn[prefixEnd] = {
       ...turn[prefixEnd],
       providerOptions: ANTHROPIC_CACHE_MARK,
-    } as CoreMessage;
+    } as ModelMessage;
   }
 
   // Breakpoint 1 — tools + system, the stable bulk of the prompt. Anthropic
   // serialises tools ahead of system, so this single breakpoint covers both.
   if (input.systemPrompt && cache.system) {
     return {
-      messages: [
-        {
-          role: 'system' as const,
-          content: input.systemPrompt,
-          providerOptions: ANTHROPIC_CACHE_MARK,
-        },
-        ...turn,
-      ],
-      system: undefined,
+      messages: turn,
+      system: {
+        role: 'system' as const,
+        content: input.systemPrompt,
+        providerOptions: ANTHROPIC_CACHE_MARK,
+      },
     };
   }
 
@@ -93,8 +94,8 @@ export function buildPrompt(input: {
 /** Assemble cache-sensitive stream inputs without cloning their stable references. */
 export function buildAgentStreamOptions<TOOLS extends ToolSet>(input: {
   model: LanguageModel;
-  system: string | undefined;
-  messages: CoreMessage[];
+  system: string | SystemModelMessage | undefined;
+  messages: ModelMessage[];
   tools: TOOLS | undefined;
   repairToolCall: ToolCallRepairFunction<TOOLS> | undefined;
   maxSteps: number;
@@ -103,11 +104,11 @@ export function buildAgentStreamOptions<TOOLS extends ToolSet>(input: {
   return {
     ...input.modelSettings,
     model: input.model,
-    ...(input.system === undefined ? {} : { system: input.system }),
+    ...(input.system === undefined ? {} : { instructions: input.system }),
     messages: input.messages,
     tools: input.tools,
-    maxSteps: input.maxSteps,
-    experimental_repairToolCall: input.repairToolCall,
+    stopWhen: isStepCount(input.maxSteps),
+    repairToolCall: input.repairToolCall,
   };
 }
 
@@ -353,7 +354,7 @@ export function createAgent(config: AgentConfig) {
 
         // Load history: prefer episodic (D1) if available, else DO storage
         const episodicLimit = config.memory?.episodic?.limit ?? 50;
-        let history: CoreMessage[] = [];
+        let history: ModelMessage[] = [];
         if (this.episodic) {
           history = await measurePhase(
             collector,
@@ -515,6 +516,11 @@ export function createAgent(config: AgentConfig) {
 
         const providerStartedAt = Date.now();
         let stepStartedAt = providerStartedAt;
+        // A persistence failure inside onEnd used to propagate into the
+        // response stream; the AI SDK now swallows onEnd errors, which would
+        // hand the consumer a turn labelled success whose memory write was
+        // silently lost. Captured here and surfaced when the body closes.
+        let turnFailure: unknown;
         const result = await measurePhase(
           collector,
           {
@@ -546,7 +552,7 @@ export function createAgent(config: AgentConfig) {
                   metadata: { outcome: 'first_output', model: config.model },
                 });
               },
-              onStepFinish: ({ finishReason, usage }) => {
+              onStepEnd: ({ finishReason, usage }) => {
                 const finishedAt = Date.now();
                 collector?.emit({
                   type: 'agent.step',
@@ -558,15 +564,15 @@ export function createAgent(config: AgentConfig) {
                     outcome: 'completed',
                     stepIndex,
                     finishReason,
-                    promptTokens: usage.promptTokens,
-                    completionTokens: usage.completionTokens,
+                    inputTokens: usage.inputTokens,
+                    outputTokens: usage.outputTokens,
                   },
                 });
                 stepIndex += 1;
                 stepStartedAt = finishedAt;
               },
               onError: ({ error }) => emitTerminal(error),
-              onFinish: async ({ response, usage, finishReason, providerMetadata }) => {
+              onEnd: async ({ responseMessages, usage, finalStep }) => {
                 try {
                   if (collector) {
                     collector.emit({
@@ -576,22 +582,23 @@ export function createAgent(config: AgentConfig) {
                       timestamp: Date.now(),
                       durationMs: Date.now() - requestStart,
                       // Token usage for cost telemetry. `usage` is the AI SDK's
-                      // promptTokens/completionTokens; `providerMetadata` carries the
-                      // provider-specific buckets (e.g. Anthropic prompt-cache reads/
-                      // writes, which are billed at different rates). Without these the
-                      // agent's spend is invisible to the consumer.
+                      // inputTokens/outputTokens (aggregated across steps, with
+                      // cache reads/writes in inputTokenDetails); the final step's
+                      // providerMetadata carries any remaining provider-specific
+                      // buckets. Without these the agent's spend is invisible to
+                      // the consumer.
                       metadata: {
                         model: config.model,
                         usage,
-                        finishReason,
-                        providerMetadata,
+                        finishReason: finalStep.finishReason,
+                        providerMetadata: finalStep.providerMetadata,
                       },
                     });
                   }
 
-                  const newMessages: CoreMessage[] = [
+                  const newMessages: ModelMessage[] = [
                     { role: 'user' as const, content: body.message },
-                    ...(response.messages as CoreMessage[]),
+                    ...(responseMessages as ModelMessage[]),
                   ];
 
                   // Save to DO working memory
@@ -649,7 +656,7 @@ export function createAgent(config: AgentConfig) {
                           role: 'user',
                         });
                         // Index assistant responses
-                        for (const msg of response.messages) {
+                        for (const msg of responseMessages) {
                           if (msg.role === 'assistant' && typeof msg.content === 'string') {
                             await this.semantic!.upsert(crypto.randomUUID(), msg.content, {
                               agent: config.name,
@@ -663,8 +670,9 @@ export function createAgent(config: AgentConfig) {
                   }
 
                   // Recursive memory stores its documents in DO storage;
-                  // no per-turn bookkeeping needed in onFinish.
+                  // no per-turn bookkeeping needed in onEnd.
                 } catch (error) {
+                  turnFailure = error;
                   emitTerminal(error);
                   throw error;
                 } finally {
@@ -674,7 +682,9 @@ export function createAgent(config: AgentConfig) {
             }),
         );
 
-        const response = result.toDataStreamResponse({ getErrorMessage: formatToolError });
+        const response = createUIMessageStreamResponse({
+          stream: toUIMessageStream({ stream: result.stream, onError: formatToolError }),
+        });
         if (!response.body) return response;
 
         // AI SDK/provider adapters do not consistently invoke `onError` for an
@@ -686,6 +696,12 @@ export function createAgent(config: AgentConfig) {
             try {
               const next = await reader.read();
               if (next.done) {
+                // onEnd (and any persistence failure it recorded) has settled
+                // by here: the SDK awaits it before emitting the closing part.
+                if (turnFailure !== undefined) {
+                  controller.error(toClonableError(turnFailure));
+                  return;
+                }
                 emitTerminal();
                 controller.close();
               } else {

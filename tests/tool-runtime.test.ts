@@ -1,5 +1,12 @@
 import { describe, expect, it, mock } from 'bun:test';
-import { NoSuchToolError, streamText, type LanguageModel } from 'ai';
+import {
+  createUIMessageStreamResponse,
+  isStepCount,
+  NoSuchToolError,
+  streamText,
+  toUIMessageStream,
+  type LanguageModel,
+} from 'ai';
 import { z } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import { ObservabilityCollector } from '../src/observability.js';
@@ -12,19 +19,25 @@ const ratingsInput = z.object({
 
 const unusedModel = {} as LanguageModel;
 
+const usage = {
+  inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined },
+  outputTokens: { total: 1, text: 1, reasoning: undefined },
+};
+
 type ProviderStreamPart =
   | {
       type: 'tool-call';
-      toolCallType: 'function';
       toolCallId: string;
       toolName: string;
-      args: string;
+      input: string;
     }
-  | { type: 'text-delta'; textDelta: string }
+  | { type: 'text-start'; id: string }
+  | { type: 'text-delta'; id: string; delta: string }
+  | { type: 'text-end'; id: string }
   | {
       type: 'finish';
-      finishReason: 'stop' | 'tool-calls';
-      usage: { promptTokens: number; completionTokens: number };
+      finishReason: { unified: 'stop' | 'tool-calls'; raw: string };
+      usage: typeof usage;
     };
 
 function createScriptedModel(input: { streams: ProviderStreamPart[][]; repairs?: string[] }) {
@@ -32,12 +45,12 @@ function createScriptedModel(input: { streams: ProviderStreamPart[][]; repairs?:
   const generateCalls: unknown[] = [];
   const streams = [...input.streams];
   const repairs = [...(input.repairs ?? [])];
-  const model: LanguageModel = {
-    specificationVersion: 'v1',
+  const model = {
+    specificationVersion: 'v4',
     provider: 'test',
     modelId: 'test-model',
-    defaultObjectGenerationMode: undefined,
-    doStream: mock(async (options) => {
+    supportedUrls: {},
+    doStream: mock(async (options: { prompt: unknown }) => {
       streamCalls.push(options);
       const parts = streams.shift();
       if (!parts) throw new Error('No scripted stream remains');
@@ -48,35 +61,44 @@ function createScriptedModel(input: { streams: ProviderStreamPart[][]; repairs?:
             controller.close();
           },
         }),
-        rawCall: { rawPrompt: options.prompt, rawSettings: {} },
-        warnings: [],
       };
     }),
-    doGenerate: mock(async (options) => {
+    doGenerate: mock(async (options: { prompt: unknown }) => {
       generateCalls.push(options);
       const text = repairs.shift();
       if (text === undefined) throw new Error('No scripted repair remains');
       return {
-        text,
-        finishReason: 'stop',
-        usage: { promptTokens: 1, completionTokens: 1 },
-        rawCall: { rawPrompt: options.prompt, rawSettings: {} },
-        response: {
-          id: 'repair-1',
-          timestamp: new Date(0),
-          modelId: 'test-model',
-        },
+        content: [{ type: 'text' as const, text }],
+        finishReason: { unified: 'stop' as const, raw: 'stop' },
+        usage,
         warnings: [],
-        providerMetadata: undefined,
       };
     }),
-  };
+  } as unknown as LanguageModel;
   return { model, streamCalls, generateCalls };
 }
 
-function validationValue(parameters: unknown, value: unknown): unknown {
+/** Text of a step: the start/delta/end triple the v4 spec requires. */
+function textParts(text: string): ProviderStreamPart[] {
+  return [
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: text },
+    { type: 'text-end', id: 't1' },
+  ];
+}
+
+async function uiStreamText(result: { stream: ReadableStream }, withErrors = false): Promise<string> {
+  return createUIMessageStreamResponse({
+    stream: toUIMessageStream({
+      stream: result.stream as never,
+      ...(withErrors ? { onError: formatToolError } : {}),
+    }),
+  }).text();
+}
+
+function validationValue(schema: unknown, value: unknown): unknown {
   const result = (
-    parameters as {
+    schema as {
       validate: (input: unknown) => {
         success: boolean;
         value?: unknown;
@@ -104,7 +126,7 @@ describe('buildToolRuntime()', () => {
       agentName: 'ratings-agent',
     });
 
-    expect((runtime.tools.submitRatings.parameters as { jsonSchema: unknown }).jsonSchema).toEqual(
+    expect((runtime.tools.submitRatings.inputSchema as { jsonSchema: unknown }).jsonSchema).toEqual(
       zodToJsonSchema(ratingsInput),
     );
   });
@@ -132,7 +154,7 @@ describe('buildToolRuntime()', () => {
 
     const result = await runtime.tools.submitRatings.execute?.(
       { seniorityBand: 'Manager' },
-      { toolCallId: 'call-1', messages: [] },
+      { toolCallId: 'call-1', messages: [], context: undefined },
     );
 
     expect(result).toEqual({ submitted: 'Manager' });
@@ -167,7 +189,7 @@ describe('buildToolRuntime()', () => {
     await expect(
       runtime.tools.submitRatings.execute?.(
         { seniorityBand: 'Manager' },
-        { toolCallId: 'call-1', messages: [] },
+        { toolCallId: 'call-1', messages: [], context: undefined },
       ),
     ).rejects.toThrow('private learner evidence');
 
@@ -215,11 +237,12 @@ describe('buildToolRuntime()', () => {
       threadId: 'thread-1',
     });
     const aiTool = runtime.tools.submitRatings;
-    const markedArgs = validationValue(aiTool.parameters, rawArgs);
+    const markedArgs = validationValue(aiTool.inputSchema, rawArgs);
 
     const result = await aiTool.execute?.(markedArgs, {
       toolCallId: 'call-1',
       messages: [],
+      context: undefined,
     });
 
     expect(result).toEqual({
@@ -252,26 +275,22 @@ describe('buildToolRuntime()', () => {
         [
           {
             type: 'tool-call',
-            toolCallType: 'function',
             toolCallId: 'call-1',
             toolName: 'submitRatings',
-            args: JSON.stringify({ seniorityBand: 'Senior Manager' }),
+            input: JSON.stringify({ seniorityBand: 'Senior Manager' }),
           },
           {
             type: 'finish',
-            finishReason: 'tool-calls',
-            usage: { promptTokens: 1, completionTokens: 1 },
+            finishReason: { unified: 'tool-calls', raw: 'tool-calls' },
+            usage,
           },
         ],
         [
-          {
-            type: 'text-delta',
-            textDelta: 'Your ratings were submitted. Goodbye!',
-          },
+          ...textParts('Your ratings were submitted. Goodbye!'),
           {
             type: 'finish',
-            finishReason: 'stop',
-            usage: { promptTokens: 1, completionTokens: 1 },
+            finishReason: { unified: 'stop', raw: 'stop' },
+            usage,
           },
         ],
       ],
@@ -294,33 +313,33 @@ describe('buildToolRuntime()', () => {
       context: {},
       model: scripted.model,
       modelSettings: {
-        maxTokens: 128,
+        maxOutputTokens: 128,
         providerOptions: { anthropic: { thinking: { type: 'disabled' } } },
       },
       collector,
       agentName: 'ratings-agent',
       threadId: 'thread-1',
     });
-    const onFinish = mock(async () => {});
+    const onEnd = mock(async () => {});
 
     const result = streamText({
       model: scripted.model,
-      system: 'You are a ratings agent.',
+      instructions: 'You are a ratings agent.',
       messages: [{ role: 'user', content: 'Submit my ratings.' }],
       tools: runtime.tools,
-      maxSteps: 3,
-      experimental_repairToolCall: runtime.repairToolCall,
-      onFinish,
+      stopWhen: isStepCount(3),
+      repairToolCall: runtime.repairToolCall,
+      onEnd,
     });
-    const responseBody = await result.toDataStreamResponse().text();
+    const responseBody = await uiStreamText(result);
 
     expect(responseBody).toContain('Your ratings were submitted. Goodbye!');
     expect(handled).toEqual([{ seniorityBand: 'Manager' }]);
-    expect(onFinish).toHaveBeenCalledTimes(1);
+    expect(onEnd).toHaveBeenCalledTimes(1);
     expect(scripted.generateCalls).toHaveLength(1);
     expect(scripted.generateCalls[0]).toMatchObject({
-      maxTokens: 128,
-      providerMetadata: { anthropic: { thinking: { type: 'disabled' } } },
+      maxOutputTokens: 128,
+      providerOptions: { anthropic: { thinking: { type: 'disabled' } } },
     });
     expect(JSON.stringify(scripted.generateCalls[0])).toContain('submitRatings');
     expect(JSON.stringify(scripted.generateCalls[0])).toContain('Senior Manager');
@@ -373,11 +392,12 @@ describe('buildToolRuntime()', () => {
       threadId: 'thread-1',
     });
     const aiTool = runtime.tools.submitRatings;
-    const markedArgs = validationValue(aiTool.parameters, rawArgs);
+    const markedArgs = validationValue(aiTool.inputSchema, rawArgs);
 
     const result = await aiTool.execute?.(markedArgs, {
       toolCallId: 'call-1',
       messages: [{ role: 'user', content: 'Submit my ratings.' }],
+      context: undefined,
     });
 
     expect(result).toEqual({ submitted: true });
@@ -396,22 +416,21 @@ describe('buildToolRuntime()', () => {
         [
           {
             type: 'tool-call',
-            toolCallType: 'function',
             toolCallId: 'call-1',
             toolName: 'submitRatings',
-            args: JSON.stringify({ seniorityBand: 'Senior Manager' }),
+            input: JSON.stringify({ seniorityBand: 'Senior Manager' }),
           },
           {
             type: 'finish',
-            finishReason: 'tool-calls',
-            usage: { promptTokens: 1, completionTokens: 1 },
+            finishReason: { unified: 'tool-calls', raw: 'tool-calls' },
+            usage,
           },
         ],
       ],
       repairs: [JSON.stringify({ seniorityBand: 'Senior Manager' })],
     });
     const handler = mock(async () => ({ submitted: true }));
-    const onFinish = mock(async () => {});
+    const onEnd = mock(async () => {});
     const collector = new ObservabilityCollector();
     const runtime = buildToolRuntime({
       definitions: [
@@ -432,16 +451,14 @@ describe('buildToolRuntime()', () => {
       model: scripted.model,
       messages: [{ role: 'user', content: 'Submit my ratings.' }],
       tools: runtime.tools,
-      maxSteps: 3,
-      experimental_repairToolCall: runtime.repairToolCall,
-      onFinish,
+      stopWhen: isStepCount(3),
+      repairToolCall: runtime.repairToolCall,
+      onEnd,
     });
 
-    const responseBody = await result
-      .toDataStreamResponse({ getErrorMessage: formatToolError })
-      .text();
+    const responseBody = await uiStreamText(result, true);
 
-    expect(responseBody).toContain('3:"InvalidToolArgumentsError:submitRatings:');
+    expect(responseBody).toContain('InvalidToolInputError:submitRatings:');
     expect(handler).not.toHaveBeenCalled();
     expect(
       collector.getEvents().filter((event) => event.type === 'tool.repair')[0]?.metadata,
@@ -461,16 +478,17 @@ describe('buildToolRuntime()', () => {
 
     const result = await runtime.repairToolCall({
       toolCall: {
-        toolCallType: 'function',
+        type: 'tool-call',
         toolCallId: 'call-1',
         toolName: 'missingTool',
-        args: '{}',
+        input: '{}',
       },
       tools: runtime.tools,
       error: new NoSuchToolError({ toolName: 'missingTool' }),
       messages: [],
+      instructions: undefined,
       system: undefined,
-      parameterSchema: () => ({}),
+      inputSchema: async () => ({}),
     });
 
     expect(result).toBeNull();
@@ -488,23 +506,22 @@ describe('buildToolRuntime()', () => {
         [
           {
             type: 'tool-call',
-            toolCallType: 'function',
             toolCallId: 'call-1',
             toolName: 'submitRatings',
-            args: JSON.stringify({ seniorityBand: 'Director+' }),
+            input: JSON.stringify({ seniorityBand: 'Director+' }),
           },
           {
             type: 'finish',
-            finishReason: 'tool-calls',
-            usage: { promptTokens: 1, completionTokens: 1 },
+            finishReason: { unified: 'tool-calls', raw: 'tool-calls' },
+            usage,
           },
         ],
         [
-          { type: 'text-delta', textDelta: 'Submitted.' },
+          ...textParts('Submitted.'),
           {
             type: 'finish',
-            finishReason: 'stop',
-            usage: { promptTokens: 1, completionTokens: 1 },
+            finishReason: { unified: 'stop', raw: 'stop' },
+            usage,
           },
         ],
       ],
@@ -528,22 +545,22 @@ describe('buildToolRuntime()', () => {
       collector,
       agentName: 'ratings-agent',
     });
-    const onFinish = mock(async () => {});
+    const onEnd = mock(async () => {});
     const result = streamText({
       model: scripted.model,
-      system: 'You are a ratings agent.',
+      instructions: 'You are a ratings agent.',
       messages: [{ role: 'user', content: 'Submit my ratings.' }],
       tools: runtime.tools,
-      maxSteps: 3,
-      experimental_repairToolCall: runtime.repairToolCall,
-      onFinish,
+      stopWhen: isStepCount(3),
+      repairToolCall: runtime.repairToolCall,
+      onEnd,
     });
 
-    const responseBody = await result.toDataStreamResponse().text();
+    const responseBody = await uiStreamText(result);
 
     expect(responseBody).toContain('Submitted.');
     expect(handled).toEqual([{ seniorityBand: 'Director+' }]);
-    expect(onFinish).toHaveBeenCalledTimes(1);
+    expect(onEnd).toHaveBeenCalledTimes(1);
     expect(scripted.generateCalls).toHaveLength(0);
     expect(collector.getEvents().some((event) => event.type === 'tool.repair')).toBe(false);
   });

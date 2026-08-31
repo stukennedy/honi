@@ -1,14 +1,14 @@
-import type { CoreMessage } from 'ai';
+import type { ModelMessage } from 'ai';
 
 export class ThreadMemory {
   constructor(private storage: DurableObjectStorage) {}
 
-  async load(): Promise<CoreMessage[]> {
-    const messages = await this.storage.get<CoreMessage[]>('messages');
+  async load(): Promise<ModelMessage[]> {
+    const messages = await this.storage.get<ModelMessage[]>('messages');
     return messages ?? [];
   }
 
-  async append(messages: CoreMessage[]): Promise<void> {
+  async append(messages: ModelMessage[]): Promise<void> {
     const existing = await this.load();
     existing.push(...messages);
     // JSON round-trip before storage.put: DO storage uses the v8
@@ -19,7 +19,7 @@ export class ThreadMemory {
     // Messages are provider-wire JSON semantically, so the round-trip is
     // lossless for real content and silently drops only unclonable decoration
     // instead of killing the turn.
-    await this.storage.put('messages', JSON.parse(JSON.stringify(existing)) as CoreMessage[]);
+    await this.storage.put('messages', JSON.parse(JSON.stringify(existing)) as ModelMessage[]);
   }
 
   async clear(): Promise<void> {

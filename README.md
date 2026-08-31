@@ -389,10 +389,10 @@ aiGateway: {
 
 ### Streaming
 
-All responses stream via the AI SDK data protocol, compatible with the `useChat()` hook from `ai/react`:
+All responses stream as an AI SDK UI message stream (SSE), compatible with the `useChat()` hook from `@ai-sdk/react`:
 
 ```typescript
-import { useChat } from 'ai/react';
+import { useChat } from '@ai-sdk/react';
 
 const { messages, input, handleSubmit } = useChat({
   api: 'https://your-worker.workers.dev/chat',
@@ -571,8 +571,8 @@ Returns `{ fetch, DurableObject }`.
 ### Model controls (AI SDK)
 
 `modelSettings` passes the AI SDK's common generation controls to every step:
-`maxTokens`, `temperature`, `topP`, `topK`, presence/frequency penalties, stop
-sequences, seed, and retry count. Provider-specific capabilities go under the
+`maxOutputTokens`, `temperature`, `topP`, `topK`, presence/frequency penalties,
+stop sequences, seed, and retry count. Provider-specific capabilities go under the
 AI SDK's `providerOptions` namespace and are passed through unchanged:
 
 ```ts
@@ -581,7 +581,7 @@ createAgent({
   model: 'claude-haiku-4-5',
   modelSettings: {
     temperature: 0,
-    maxTokens: 512,
+    maxOutputTokens: 512,
     providerOptions: {
       anthropic: { thinking: { type: 'disabled' } },
       // Gemini alternative:

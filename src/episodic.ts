@@ -1,6 +1,6 @@
-import type { CoreMessage } from 'ai';
+import type { ModelMessage } from 'ai';
 
-function toMessage(r: { role: string; content: string }): CoreMessage {
+function toMessage(r: { role: string; content: string }): ModelMessage {
   const content = r.content;
   switch (r.role) {
     case 'user': return { role: 'user', content };
@@ -31,7 +31,7 @@ export class EpisodicMemory {
   async append(
     agentName: string,
     threadId: string,
-    messages: CoreMessage[],
+    messages: ModelMessage[],
   ): Promise<void> {
     const now = Date.now();
     const stmt = this.db.prepare(
@@ -54,7 +54,7 @@ export class EpisodicMemory {
     agentName: string,
     threadId: string,
     limit = 50,
-  ): Promise<CoreMessage[]> {
+  ): Promise<ModelMessage[]> {
     const { results } = await this.db
       .prepare(
         'SELECT role, content FROM honi_messages WHERE agent_name = ? AND thread_id = ? ORDER BY created_at ASC LIMIT ?',
@@ -77,7 +77,7 @@ export class EpisodicMemory {
     agentName: string,
     query: string,
     limit = 10,
-  ): Promise<CoreMessage[]> {
+  ): Promise<ModelMessage[]> {
     const { results } = await this.db
       .prepare(
         'SELECT role, content FROM honi_messages WHERE agent_name = ? AND content LIKE ? ORDER BY created_at DESC LIMIT ?',

@@ -38,7 +38,7 @@ function endlessAttempt() {
       rawCall: {},
       stream: new ReadableStream({
         pull(controller) {
-          controller.enqueue({ type: 'text-delta', textDelta: 'tick' });
+          controller.enqueue({ type: 'text-delta', delta: 'tick' });
         },
         cancel(reason) {
           state.cancelled = true;
@@ -52,7 +52,7 @@ function endlessAttempt() {
 function fakeModel(attempts: Array<() => any>) {
   let i = 0;
   return {
-    specificationVersion: 'v1',
+    specificationVersion: 'v4',
     provider: 'test',
     modelId: 'test-model',
     doGenerate: async () => ({}),
@@ -80,7 +80,7 @@ async function drain(stream: ReadableStream): Promise<{ parts: Part[]; error?: u
 }
 
 const EMPTY = [{ type: 'finish', finishReason: 'unknown' }];
-const TEXT = [{ type: 'text-delta', textDelta: 'hello' }, { type: 'finish', finishReason: 'stop' }];
+const TEXT = [{ type: 'text-delta', id: '1', delta: 'hello' }, { type: 'finish', finishReason: 'stop' }];
 
 describe('withEmptyStreamRetry', () => {
   it('re-issues a stream that closed cleanly with zero output', async () => {
@@ -88,7 +88,7 @@ describe('withEmptyStreamRetry', () => {
     const wrapped = withEmptyStreamRetry(model, { label: 'test', escalated: false }) as any;
     const { parts, error } = await drain((await wrapped.doStream({})).stream);
     expect(error).toBeUndefined();
-    expect(parts.some((p) => p.type === 'text-delta' && p.textDelta === 'hello')).toBe(true);
+    expect(parts.some((p) => p.type === 'text-delta' && p.delta === 'hello')).toBe(true);
   });
 
   it('passes content straight through without retrying', async () => {
@@ -111,12 +111,12 @@ describe('withEmptyStreamRetry', () => {
     const boom = new Error('upstream died mid-retry');
     const model = fakeModel([
       () => attempt(EMPTY),
-      () => attempt([{ type: 'text-delta', textDelta: 'partial' }], boom),
+      () => attempt([{ type: 'text-delta', id: '1', delta: 'partial' }], boom),
     ]);
     const wrapped = withEmptyStreamRetry(model, { label: 'test', escalated: false }) as any;
     const { parts, error } = await drain((await wrapped.doStream({})).stream);
     expect(error).toBe(boom);
-    expect(parts).toEqual([{ type: 'text-delta', textDelta: 'partial' }]);
+    expect(parts).toEqual([{ type: 'text-delta', id: '1', delta: 'partial' }]);
     // The first attempt's held parts must NOT be appended on top.
     expect(parts.some((p) => p.type === 'finish')).toBe(false);
   });
@@ -133,7 +133,7 @@ describe('withEmptyStreamRetry', () => {
 
   it('surfaces a first attempt that dies mid-stream instead of retrying it away', async () => {
     const boom = new Error('first attempt died');
-    const model = fakeModel([() => attempt([{ type: 'text-delta', textDelta: 'x' }], boom)]);
+    const model = fakeModel([() => attempt([{ type: 'text-delta', id: '1', delta: 'x' }], boom)]);
     const wrapped = withEmptyStreamRetry(model, { label: 'test', escalated: false }) as any;
     const { error } = await drain((await wrapped.doStream({})).stream);
     expect(error).toBe(boom);
@@ -185,7 +185,7 @@ describe('withEmptyStreamRetry', () => {
     });
     let opened = 0;
     const model = {
-      specificationVersion: 'v1',
+      specificationVersion: 'v4',
       provider: 'test',
       modelId: 'test-model',
       doGenerate: async () => ({}),

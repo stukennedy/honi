@@ -163,23 +163,20 @@ describe('RecursiveMemory', () => {
 
     // Mock LanguageModel that immediately returns a text answer (no tool calls)
     const mockModel = {
-      specificationVersion: 'v1' as const,
+      specificationVersion: 'v4' as const,
       provider: 'mock',
       modelId: 'mock-model',
-      defaultObjectGenerationMode: undefined,
+      supportedUrls: {},
       doGenerate: mock(async () => ({
-        text: 'You need Bridge 1.4 for ARM Macs.',
-        finishReason: 'stop',
-        usage: { promptTokens: 10, completionTokens: 10 },
-        rawCall: { rawPrompt: '', rawSettings: {} },
-        toolCalls: [],
-        toolResults: [],
-        response: { id: 'mock', timestamp: new Date(), modelId: 'mock-model' },
+        content: [{ type: 'text' as const, text: 'You need Bridge 1.4 for ARM Macs.' }],
+        finishReason: 'stop' as const,
+        usage: {
+          inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
+          outputTokens: { total: 10, text: 10, reasoning: undefined },
+        },
         warnings: [],
-        providerMetadata: undefined,
-        steps: [],
       })),
-      doStream: mock(async () => ({ stream: new ReadableStream(), rawCall: { rawPrompt: '', rawSettings: {} }, warnings: [] })),
+      doStream: mock(async () => ({ stream: new ReadableStream() })),
     };
 
     const result = await mem.runLoop(
@@ -189,7 +186,7 @@ describe('RecursiveMemory', () => {
       undefined,
       undefined,
       {
-        maxTokens: 256,
+        maxOutputTokens: 256,
         providerOptions: { google: { thinkingConfig: { thinkingBudget: 0 } } },
       },
     );
@@ -199,8 +196,8 @@ describe('RecursiveMemory', () => {
     expect(Array.isArray(result.chunksRead)).toBe(true);
     expect(mockModel.doGenerate).toHaveBeenCalledWith(
       expect.objectContaining({
-        maxTokens: 256,
-        providerMetadata: { google: { thinkingConfig: { thinkingBudget: 0 } } },
+        maxOutputTokens: 256,
+        providerOptions: { google: { thinkingConfig: { thinkingBudget: 0 } } },
       }),
     );
   });

@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.9.0 — 2026-08-31
+
+Migrates from AI SDK 4 to AI SDK 7 (`ai@^7`, provider packages at their
+current majors). The driving reason is Gemini thought signatures: Gemini 3
+rejects (400 `INVALID_ARGUMENT`) any history `functionCall` part without a
+`thoughtSignature`, and the AI SDK 4-era `@ai-sdk/google` predated signatures
+entirely, forcing honidev to patch request bodies in a fetch wrapper. On
+`@ai-sdk/google@4` the provider owns the whole story natively.
+
+### Changed — thought signatures (the headline)
+
+- **Native `gemini-*` models now round-trip thought signatures.** The provider
+  returns `providerOptions.google.thoughtSignature` on assistant tool-call
+  parts; honidev's memory persists them as plain JSON and replays them next
+  turn. New regression tests (`tests/thought-signature.test.ts`) pin all three
+  legs: replay of a stored signature, response signatures surviving
+  JSON persistence, and the fallback below.
+- **honidev's fetch-level sentinel hack is gone.** For history with no
+  signatures (threads saved by honidev < 0.9, or histories built by hand) the
+  provider itself injects Google's documented
+  `skip_thought_signature_validator` sentinel — old threads keep working with
+  no action needed.
+
+### Breaking — API renames inherited from AI SDK 5–7
+
+- **Wire format:** `/chat` now streams the AI SDK UI message stream (SSE),
+  consumed by `useChat()` from `@ai-sdk/react`. Consumers of the old v4 data
+  protocol (`0:`/`9:`/`3:` frames) must migrate.
+- **`ModelSettings.maxTokens` → `maxOutputTokens`.**
+- **`ModelSettings.toolCallStreaming` removed** — tool-call streaming is
+  always on in AI SDK 5+.
+- **Message type:** honidev's memory APIs (`ThreadMemory`, `EpisodicMemory`)
+  now type messages as `ModelMessage` (was `CoreMessage`). Stored threads are
+  compatible; this is a type-level rename.
+- **Peer dependencies:** optional provider packages must be on their AI SDK
+  5-compatible majors (`@ai-sdk/groq@^4`, `@ai-sdk/deepseek@^3`, …); `zod`
+  minimum is 3.25.76.
+- **OpenAI-family models pin Chat Completions.** `gpt-*`, `azure/*` and the
+  OpenAI-compatible bridges now call `.chat()` explicitly — the bare factory
+  in `@ai-sdk/openai@4` defaults to the Responses API, which gateway/proxy
+  routes don't uniformly support.
+
+### Changed
+
+- **Telemetry field names follow the SDK:** `agent.step` events carry
+  `inputTokens`/`outputTokens` (was `promptTokens`/`completionTokens`);
+  `agent.response` usage is the SDK's aggregated `LanguageModelUsage` (cache
+  reads/writes now live in `usage.inputTokenDetails`).
+- **Prompt-cache breakpoints ride `instructions`.** AI SDK 7 rejects system
+  messages inside `messages`, so a cached system prompt is now passed as a
+  `SystemModelMessage` (carrying `providerOptions`) via the `instructions`
+  option instead of being moved into the message array. Behaviour on the wire
+  is unchanged.
+- **`GOOGLE_THINKING_CONFIG` stays on the fetch wrapper** even though
+  `@ai-sdk/google@4` accepts `thinkingLevel` via providerOptions: the
+  empty-stream retry escalation switches configs per request, which a static
+  providerOptions value cannot express.
+- **A persistence failure still fails the turn.** AI SDK 7 swallows `onEnd`
+  callback errors; honidev captures them and errors the response body at
+  close, so a consumer is never handed a turn labelled success whose memory
+  write was silently lost.
+
 ## 0.8.5 — 2026-08-28
 
 Folds in behaviour that had been living as a downstream `dist/` patch

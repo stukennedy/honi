@@ -4,6 +4,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { createWorkersAI } from 'workers-ai-provider';
 import { createAiGateway, type AiGatewayOptions } from 'ai-gateway-provider';
 import type { LanguageModel } from 'ai';
+import type { LanguageModelV4 } from '@ai-sdk/provider';
 
 /**
  * Cloudflare AI Gateway configuration.
@@ -87,7 +88,10 @@ async function dynamicImport<T>(pkg: string, hint: string): Promise<T> {
  * REST endpoint with `accountId` + optional `cf-aig-authorization` token.
  */
 function wrapWithGateway(
-  model: LanguageModel,
+  // `LanguageModel` also admits bare gateway model-id strings and older spec
+  // versions; everything resolveModel constructs is a current-spec model
+  // object, which is what the AI Gateway wrapper requires.
+  model: LanguageModelV4,
   gateway: AiGatewayConfig,
   env: Record<string, unknown>,
 ): LanguageModel {
@@ -151,19 +155,16 @@ export function withEmptyStreamRetry(
   model: LanguageModel,
   opts: { label: string; escalated: boolean; onRetry?: () => void },
 ): LanguageModel {
-  type StreamPart = { type?: string; textDelta?: unknown; finishReason?: unknown; error?: unknown };
+  type StreamPart = { type?: string; delta?: unknown; finishReason?: unknown; error?: unknown };
   const isContent = (part: StreamPart): boolean =>
-    (part?.type === 'text-delta' && typeof part.textDelta === 'string' && part.textDelta.length > 0) ||
+    (part?.type === 'text-delta' && typeof part.delta === 'string' && part.delta.length > 0) ||
     part?.type === 'tool-call';
   const m = model as unknown as Record<string, any>;
   return {
     specificationVersion: m.specificationVersion,
     provider: m.provider,
     modelId: m.modelId,
-    defaultObjectGenerationMode: m.defaultObjectGenerationMode,
-    supportsImageUrls: m.supportsImageUrls,
-    supportsStructuredOutputs: m.supportsStructuredOutputs,
-    ...(m.supportsUrl ? { supportsUrl: m.supportsUrl.bind(m) } : {}),
+    supportedUrls: m.supportedUrls,
     doGenerate: (options: unknown) => m.doGenerate(options),
     doStream: async (options: unknown) => {
       const first = await m.doStream(options);
@@ -387,7 +388,7 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   const gateway = options?.gateway;
   const headers = options?.headers;
   const env = options?.env ?? {};
-  const viaGateway = (model: LanguageModel): LanguageModel =>
+  const viaGateway = (model: LanguageModelV4): LanguageModel =>
     gateway ? wrapWithGateway(model, gateway, env) : model;
 
   // ── Anthropic ──────────────────────────────────────────────────────────────
@@ -460,7 +461,10 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
     if (headers) opts.headers = headers;
     const apiKey = resolveApiKey(env, 'OPENAI_API_KEY', gateway);
     if (apiKey) opts.apiKey = apiKey;
-    return viaGateway(createOpenAI(opts)(modelId));
+    // `.chat()` pins the Chat Completions wire format. The bare factory call
+    // now defaults to the Responses API, which gateways and proxies routing
+    // /chat/completions do not uniformly support.
+    return viaGateway(createOpenAI(opts).chat(modelId));
   }
 
   // ── Google Gemini ─────────────────────────────────────────────────────────
@@ -496,11 +500,10 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
     // GOOGLE_THINKING_CONFIG (raw JSON, e.g. '{"thinkingLevel":"minimal"}' or
     // '{"thinkingBudget":0}') injects the Gemini API's
     // `generationConfig.thinkingConfig` into every request body — the knob
-    // that sets thinking effort on models honouring it. It rides the fetch
-    // wrapper below, NOT modelSettings.providerOptions: @ai-sdk/google's
-    // provider-options zod schema admits only thinkingBudget/includeThoughts
-    // and silently STRIPS unknown keys, so thinkingLevel (the 3.x control)
-    // can only reach the wire here.
+    // that sets thinking effort on models honouring it. It stays on the fetch
+    // wrapper (even though @ai-sdk/google now accepts thinkingLevel via
+    // providerOptions) because the empty-stream retry escalation below has to
+    // switch configs PER REQUEST, which a static providerOptions value cannot.
     //
     // GOOGLE_THINKING_CONFIG_RETRY is the config used on an EMPTY-STREAM
     // RETRY only: gemini-3.5-flash-lite at thinkingLevel "minimal"
@@ -526,28 +529,24 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
     // an unrelated request think harder — safe by design.
     let thinkingEscalations = 0;
 
-    // The wrapper is ALWAYS installed on this branch — independent of any
-    // thinking config — because of the thought-signature repair: the Gemini
-    // 3.x API REJECTS (400 INVALID_ARGUMENT) any history functionCall part
-    // without a thoughtSignature, and @ai-sdk/google predates signatures
-    // entirely (strips them from responses, never replays them), so every
-    // post-tool-call turn dies without this. Google's documented escape hatch
-    // for history not produced with signatures is the sentinel below
+    // Thought signatures need no fetch-level repair on AI SDK v5+: the Google
+    // provider round-trips `providerOptions.google.thoughtSignature` on
+    // assistant tool-call parts (so signed history replays correctly), and for
+    // history that carries no signature — threads saved under honidev < 0.9,
+    // or histories rebuilt from plain text — it injects Google's documented
+    // `skip_thought_signature_validator` sentinel itself rather than letting
+    // the Gemini 3 API reject the request with 400 INVALID_ARGUMENT
     // (ai.google.dev/gemini-api/docs/thought-signatures).
+    //
+    // The wrapper is still ALWAYS installed on this branch: the thinking-knob
+    // injection below is env-driven and per-request (the retry escalation
+    // cannot be expressed as a static providerOptions value), and the 4xx
+    // detail logging is the only place Google's field-level error text
+    // survives content-free caller logging.
     opts.fetch = (async (url: string, init?: RequestInit) => {
       let nextInit = init;
       try {
         const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, any>;
-        if (Array.isArray(body.contents)) {
-          for (const content of body.contents) {
-            if (!Array.isArray(content?.parts)) continue;
-            for (const part of content.parts) {
-              if (part && typeof part === 'object' && part.functionCall && !part.thoughtSignature) {
-                part.thoughtSignature = 'context_engineering_is_the_way_to_go';
-              }
-            }
-          }
-        }
         let effectiveThinking = thinkingConfig;
         if (thinkingEscalations > 0 && retryThinkingConfig) {
           thinkingEscalations--;
@@ -641,7 +640,6 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
     const openai = createOpenAI({
       baseURL: 'https://workers-ai.binding.internal/v1',
       apiKey: 'workers-ai-binding',
-      compatibility: 'compatible',
       fetch: bindingFetch,
     });
     return openai.chat(modelId);
@@ -664,7 +662,7 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   // Models: groq/llama-3.3-70b-versatile, groq/mixtral-8x7b-32768, groq/gemma2-9b-it, etc.
   // Env:    GROQ_API_KEY (optional with AI Gateway stored keys)
   if (modelId.startsWith('groq/')) {
-    const mod = await dynamicImport<{ createGroq: (o: { apiKey?: string }) => (m: string) => LanguageModel }>(
+    const mod = await dynamicImport<{ createGroq: (o: { apiKey?: string }) => (m: string) => LanguageModelV4 }>(
       '@ai-sdk/groq',
       'Run: npm install @ai-sdk/groq',
     );
@@ -676,7 +674,7 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   // Models: deepseek-chat, deepseek-reasoner
   // Env:    DEEPSEEK_API_KEY (optional with AI Gateway stored keys)
   if (modelId.startsWith('deepseek-')) {
-    const mod = await dynamicImport<{ createDeepSeek: (o: { apiKey?: string }) => (m: string) => LanguageModel }>(
+    const mod = await dynamicImport<{ createDeepSeek: (o: { apiKey?: string }) => (m: string) => LanguageModelV4 }>(
       '@ai-sdk/deepseek',
       'Run: npm install @ai-sdk/deepseek',
     );
@@ -688,7 +686,7 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   // Models: mistral-large-latest, mistral-small-latest, codestral-latest, etc.
   // Env:    MISTRAL_API_KEY (optional with AI Gateway stored keys)
   if (modelId.startsWith('mistral-') || modelId.startsWith('codestral-') || modelId.startsWith('pixtral-')) {
-    const mod = await dynamicImport<{ createMistral: (o: { apiKey?: string }) => (m: string) => LanguageModel }>(
+    const mod = await dynamicImport<{ createMistral: (o: { apiKey?: string }) => (m: string) => LanguageModelV4 }>(
       '@ai-sdk/mistral',
       'Run: npm install @ai-sdk/mistral',
     );
@@ -700,7 +698,7 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   // Models: grok-3, grok-3-mini, grok-2, grok-beta
   // Env:    XAI_API_KEY (optional with AI Gateway stored keys)
   if (modelId.startsWith('grok-')) {
-    const mod = await dynamicImport<{ createXai: (o: { apiKey?: string }) => (m: string) => LanguageModel }>(
+    const mod = await dynamicImport<{ createXai: (o: { apiKey?: string }) => (m: string) => LanguageModelV4 }>(
       '@ai-sdk/xai',
       'Run: npm install @ai-sdk/xai',
     );
@@ -712,7 +710,7 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   // Models: sonar, sonar-pro, sonar-reasoning, sonar-reasoning-pro
   // Env:    PERPLEXITY_API_KEY (optional with AI Gateway stored keys)
   if (modelId.startsWith('sonar') || modelId.startsWith('perplexity/')) {
-    const mod = await dynamicImport<{ createPerplexity: (o: { apiKey?: string }) => (m: string) => LanguageModel }>(
+    const mod = await dynamicImport<{ createPerplexity: (o: { apiKey?: string }) => (m: string) => LanguageModelV4 }>(
       '@ai-sdk/perplexity',
       'Run: npm install @ai-sdk/perplexity',
     );
@@ -725,7 +723,7 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   // Models: together/meta-llama/Llama-3.3-70B-Instruct-Turbo, together/mistralai/Mixtral-8x7B, etc.
   // Env:    TOGETHER_API_KEY (AI Gateway routing not supported — always direct)
   if (modelId.startsWith('together/')) {
-    const mod = await dynamicImport<{ createTogetherAI: (o: { apiKey?: string }) => (m: string) => LanguageModel }>(
+    const mod = await dynamicImport<{ createTogetherAI: (o: { apiKey?: string }) => (m: string) => LanguageModelV4 }>(
       '@ai-sdk/togetherai',
       'Run: npm install @ai-sdk/togetherai',
     );
@@ -737,7 +735,7 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   // Models: command-r-plus, command-r, command-a-03-2025, etc.
   // Env:    COHERE_API_KEY (AI Gateway routing not supported — always direct)
   if (modelId.startsWith('command-')) {
-    const mod = await dynamicImport<{ createCohere: (o: { apiKey?: string }) => (m: string) => LanguageModel }>(
+    const mod = await dynamicImport<{ createCohere: (o: { apiKey?: string }) => (m: string) => LanguageModelV4 }>(
       '@ai-sdk/cohere',
       'Run: npm install @ai-sdk/cohere',
     );
@@ -749,13 +747,17 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
   // Models: azure/gpt-4o, azure/gpt-4-turbo, etc.
   // Env:    AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT
   if (modelId.startsWith('azure/')) {
-    const mod = await dynamicImport<{ createAzure: (o: { apiKey?: string; baseURL?: string }) => (m: string) => LanguageModel }>(
+    const mod = await dynamicImport<{
+      createAzure: (o: { apiKey?: string; baseURL?: string }) => { chat: (m: string) => LanguageModelV4 };
+    }>(
       '@ai-sdk/azure',
       'Run: npm install @ai-sdk/azure',
     );
     const apiKey = resolveApiKey(env, 'AZURE_OPENAI_API_KEY', gateway);
     const endpoint = env.AZURE_OPENAI_ENDPOINT as string | undefined;
-    return viaGateway(mod.createAzure({ apiKey, baseURL: endpoint })(modelId.slice(6)));
+    // `.chat()` pins Chat Completions — the bare factory now defaults to the
+    // Responses API, which gateway/proxy routes don't uniformly support.
+    return viaGateway(mod.createAzure({ apiKey, baseURL: endpoint }).chat(modelId.slice(6)));
   }
 
   // ── OpenRouter ────────────────────────────────────────────────────────────
@@ -874,7 +876,6 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
     const openrouter = createOpenAI({
       baseURL: 'https://openrouter.ai/api/v1',
       apiKey,
-      compatibility: 'compatible',
       fetch: openrouterFetch as unknown as typeof fetch,
       ...(headers ? { headers } : {}),
     });
