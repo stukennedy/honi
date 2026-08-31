@@ -320,4 +320,19 @@ describe('marker-prefixed rows that are not ours', () => {
     expect(loaded[0]).toEqual({ role: 'assistant', content: 'honi::parts::{not json' });
     expect(loaded[1]).toEqual({ role: 'user', content: 'honi::parts::hello from a legacy row' });
   });
+
+  it('preserves marker rows whose JSON is not a parts array', async () => {
+    // Valid JSON of the wrong shape is just as much "not ours" as garbage:
+    // decoding `"hello"` would silently unquote it, and `null` would become
+    // invalid message content that fails prompt validation on every turn.
+    const rows = [
+      'honi::parts::"hello"',
+      'honi::parts::null',
+      'honi::parts::[{"noType":true}]',
+      'honi::parts::42',
+    ];
+    const { db } = fakeD1(rows.map((content) => ({ role: 'user', content })));
+    const loaded = await new EpisodicMemory(db).load('agent', 'thread');
+    expect(loaded).toEqual(rows.map((content) => ({ role: 'user', content })));
+  });
 });

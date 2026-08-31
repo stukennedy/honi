@@ -87,18 +87,29 @@ function parseStructuredContent(
   opts: { legacyParts: boolean },
 ): string | Array<Record<string, unknown>> {
   if (raw.startsWith(PARTS_MARKER)) {
+    // A parts row WE wrote is always a JSON ARRAY of typed part objects, and
+    // encodeContent escapes any plain string that starts with a marker — so a
+    // marker-prefixed row holding anything else (unparseable text, or valid
+    // JSON of the wrong shape like `"hello"` or `null`) is provably not ours.
+    // Never alter content that cannot be positively identified as this
+    // encoding: return it byte-for-byte.
     try {
-      return JSON.parse(raw.slice(PARTS_MARKER.length), binaryReviver) as Array<
-        Record<string, unknown>
-      >;
+      const parsed = JSON.parse(raw.slice(PARTS_MARKER.length), binaryReviver) as unknown;
+      if (
+        Array.isArray(parsed) &&
+        parsed.every(
+          (part) =>
+            part !== null &&
+            typeof part === 'object' &&
+            typeof (part as { type?: unknown }).type === 'string',
+        )
+      ) {
+        return parsed as Array<Record<string, unknown>>;
+      }
     } catch {
-      // A parts row WE wrote always carries valid JSON, and encodeContent
-      // escapes any plain string that starts with a marker — so a
-      // marker-prefixed row that does NOT parse is provably not ours
-      // (pre-marker text, or corruption). Never alter content that cannot be
-      // positively identified as this encoding: return it byte-for-byte.
-      return raw;
+      // Unparseable — same conclusion as the wrong-shape case below.
     }
+    return raw;
   }
   if (raw.startsWith(TEXT_MARKER)) return raw.slice(TEXT_MARKER.length);
   // Legacy inference is a per-ROLE decision: pre-marker assistant and tool
