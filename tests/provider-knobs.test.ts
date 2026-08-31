@@ -73,6 +73,22 @@ describe('ThreadMemory tolerates unclonable decoration on messages', () => {
     expect(loaded[0].content[0].data).toBeInstanceOf(Uint8Array);
     expect([...loaded[0].content[0].data]).toEqual([...bytes]);
   });
+
+  it('leaves envelope-shaped application data alone', async () => {
+    // Tool args are arbitrary JSON — data that mimics the internal binary
+    // envelope must survive the round-trip as the same object.
+    const memory = new ThreadMemory(createMockStorage());
+    const args = { __honi_binary__: 'u8', b64: 'not base64 at all' };
+    await memory.append([
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'c', toolName: 'export', input: args }],
+      } as any,
+    ]);
+
+    const loaded = (await memory.load()) as any[];
+    expect(loaded[0].content[0].input).toEqual(args);
+  });
 });
 
 describe('direct-API providers fail loudly on a missing key', () => {

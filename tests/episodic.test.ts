@@ -197,6 +197,39 @@ describe('EpisodicMemory round-trips structured content', () => {
     expect(modelMessageSchema.safeParse(loaded[0]).success).toBe(true);
   });
 
+  it('round-trips application data shaped like the binary envelope', async () => {
+    // Tool outputs are arbitrary JSON — a payload that happens to carry
+    // __honi_binary__/b64 keys must come back as the same OBJECT, not get
+    // revived into a Uint8Array (or crash atob).
+    const collision: ModelMessage[] = [
+      {
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolCallId: 'c1',
+            toolName: 'export',
+            output: {
+              type: 'json',
+              value: {
+                __honi_binary__: 'u8',
+                b64: 'definitely *not* base64!!',
+                nested: { __honi_binary__: 'ab', b64: 'AQID' },
+              },
+            },
+          },
+        ],
+      },
+    ];
+    const { db } = fakeD1();
+    const memory = new EpisodicMemory(db);
+    await memory.append('agent', 'thread', collision);
+
+    const loaded = await memory.load('agent', 'thread');
+    expect(loaded).toEqual(collision);
+    expect(modelMessageSchema.safeParse(loaded[0]).success).toBe(true);
+  });
+
   it('treats legacy bare-JSON rows with unknown part types as text', async () => {
     // Pre-marker rows are decoded by shape, but ONLY for known part types.
     const { db } = fakeD1([
