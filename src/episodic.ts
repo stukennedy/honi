@@ -92,7 +92,9 @@ function parseStructuredContent(
         Record<string, unknown>
       >;
     } catch {
-      return raw;
+      // Corrupt marker row: degrade to its JSON text, WITHOUT the prefix —
+      // the model has no use for the internal encoding scheme's name.
+      return raw.slice(PARTS_MARKER.length);
     }
   }
   if (raw.startsWith(TEXT_MARKER)) return raw.slice(TEXT_MARKER.length);
@@ -142,21 +144,41 @@ function toMessage(r: { role: string; content: string }): ModelMessage {
 }
 
 export class EpisodicMemory {
+  /**
+   * Schema creation, memoized per instance. Nothing in the library ever
+   * called `init()` — a fresh D1 binding threw "no such table" on the first
+   * turn — so every data path now ensures the schema lazily. The memoized
+   * promise makes the cost one round-trip per DO instance lifetime, and a
+   * failed attempt clears it so the next call retries instead of caching the
+   * failure forever. Statements run individually via prepare(): D1's `exec()`
+   * has line-oriented parsing quirks that reject pretty-printed multi-line
+   * SQL — untestable locally, so not worth depending on.
+   */
+  private schemaReady: Promise<void> | undefined;
+
   constructor(private db: D1Database) {}
 
   async init(): Promise<void> {
-    await this.db.exec(`
-      CREATE TABLE IF NOT EXISTS honi_messages (
-        id TEXT PRIMARY KEY,
-        agent_name TEXT NOT NULL,
-        thread_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_honi_messages_thread
-        ON honi_messages(agent_name, thread_id, created_at);
-    `);
+    await this.db
+      .prepare(
+        'CREATE TABLE IF NOT EXISTS honi_messages (id TEXT PRIMARY KEY, agent_name TEXT NOT NULL, thread_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL)',
+      )
+      .run();
+    await this.db
+      .prepare(
+        'CREATE INDEX IF NOT EXISTS idx_honi_messages_thread ON honi_messages(agent_name, thread_id, created_at)',
+      )
+      .run();
+  }
+
+  private ensureSchema(): Promise<void> {
+    if (!this.schemaReady) {
+      this.schemaReady = this.init().catch((error) => {
+        this.schemaReady = undefined;
+        throw error;
+      });
+    }
+    return this.schemaReady;
   }
 
   async append(
@@ -164,6 +186,7 @@ export class EpisodicMemory {
     threadId: string,
     messages: ModelMessage[],
   ): Promise<void> {
+    await this.ensureSchema();
     const now = Date.now();
     const stmt = this.db.prepare(
       'INSERT INTO honi_messages (id, agent_name, thread_id, role, content, created_at) VALUES (?, ?, ?, ?, ?, ?)',
@@ -186,9 +209,20 @@ export class EpisodicMemory {
     threadId: string,
     limit = 50,
   ): Promise<ModelMessage[]> {
+    await this.ensureSchema();
+    // The NEWEST `limit` rows, replayed in chronological order. A plain
+    // `ORDER BY created_at ASC LIMIT n` returns the OLDEST n instead: once a
+    // thread outgrows the limit, recent turns never enter the context again
+    // and the window silently freezes on the first n rows forever.
     const { results } = await this.db
       .prepare(
-        'SELECT role, content FROM honi_messages WHERE agent_name = ? AND thread_id = ? ORDER BY created_at ASC LIMIT ?',
+        `SELECT role, content FROM honi_messages
+         WHERE id IN (
+           SELECT id FROM honi_messages
+           WHERE agent_name = ? AND thread_id = ?
+           ORDER BY created_at DESC LIMIT ?
+         )
+         ORDER BY created_at ASC`,
       )
       .bind(agentName, threadId, limit)
       .all<{ role: string; content: string }>();
@@ -196,6 +230,7 @@ export class EpisodicMemory {
   }
 
   async clear(agentName: string, threadId: string): Promise<void> {
+    await this.ensureSchema();
     await this.db
       .prepare(
         'DELETE FROM honi_messages WHERE agent_name = ? AND thread_id = ?',
@@ -209,6 +244,7 @@ export class EpisodicMemory {
     query: string,
     limit = 10,
   ): Promise<ModelMessage[]> {
+    await this.ensureSchema();
     const { results } = await this.db
       .prepare(
         'SELECT role, content FROM honi_messages WHERE agent_name = ? AND content LIKE ? ORDER BY created_at DESC LIMIT ?',

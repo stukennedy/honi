@@ -893,23 +893,40 @@ export function createAgent(config: AgentConfig) {
     return stub.fetch(new Request('https://do/history', { method: 'DELETE' }));
   });
 
+  /**
+   * Constant-time string equality for the bearer check. `!==` short-circuits
+   * on the first differing byte, letting response timing narrow the secret
+   * one character at a time. (A length mismatch still returns early — the
+   * secret's length is not treated as confidential.)
+   */
+  const timingSafeEqual = (a: string, b: string): boolean => {
+    const encoder = new TextEncoder();
+    const left = encoder.encode(a);
+    const right = encoder.encode(b);
+    if (left.length !== right.length) return false;
+    let diff = 0;
+    for (let i = 0; i < left.length; i++) diff |= left[i] ^ right[i];
+    return diff === 0;
+  };
+
+  /** Bearer check shared by every MCP surface (POST /mcp AND GET /mcp/tools). */
+  const mcpUnauthorized = (env: Record<string, unknown>, authHeader: string): boolean => {
+    if (!config.mcp?.secretEnvVar) return false;
+    const secret = env[config.mcp.secretEnvVar] as string | undefined;
+    if (!secret) {
+      console.warn(
+        `[honi] mcp.secretEnvVar "${config.mcp.secretEnvVar}" is set but env var not found — MCP endpoint is unauthenticated`,
+      );
+      return false;
+    }
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    return !timingSafeEqual(token, secret);
+  };
+
   // MCP Server endpoint — exposes agent tools to MCP clients
   app.post('/mcp', async (c) => {
-    // Auth: check Bearer token if secretEnvVar is configured
-    if (config.mcp?.secretEnvVar) {
-      const env = c.env as Record<string, unknown>;
-      const secret = env[config.mcp.secretEnvVar] as string | undefined;
-      if (secret) {
-        const authHeader = c.req.header('Authorization') ?? '';
-        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-        if (token !== secret) {
-          return c.json({ error: 'Unauthorized' }, 401);
-        }
-      } else {
-        console.warn(
-          `[honi] mcp.secretEnvVar "${config.mcp.secretEnvVar}" is set but env var not found — MCP endpoint is unauthenticated`,
-        );
-      }
+    if (mcpUnauthorized(c.env as Record<string, unknown>, c.req.header('Authorization') ?? '')) {
+      return c.json({ error: 'Unauthorized' }, 401);
     }
 
     const env = c.env as Record<string, DurableObjectNamespace>;
@@ -929,8 +946,13 @@ export function createAgent(config: AgentConfig) {
     );
   });
 
-  // MCP tools list (convenience GET endpoint)
+  // MCP tools list (convenience GET endpoint). Guarded by the same bearer
+  // check as POST /mcp — tool names, descriptions, and schemas are a map of
+  // the agent's capabilities, not public metadata.
   app.get('/mcp/tools', async (c) => {
+    if (mcpUnauthorized(c.env as Record<string, unknown>, c.req.header('Authorization') ?? '')) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
     const mcpServer = createMcpServer(config.tools ?? []);
     return c.json({ tools: mcpServer.tools });
   });

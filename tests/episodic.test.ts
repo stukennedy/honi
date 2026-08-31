@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { modelMessageSchema, type ModelMessage } from 'ai';
 import { EpisodicMemory } from '../src/episodic.js';
 
@@ -24,6 +25,7 @@ function fakeD1(seed: Row[] = []) {
       all: async <T>() => ({ results: rows as unknown as T[] }),
       run: async () => ({}),
     }),
+    run: async () => ({}),
   });
   const db = {
     prepare: statement,
@@ -36,6 +38,32 @@ function fakeD1(seed: Row[] = []) {
     },
   } as unknown as D1Database;
   return { db, rows };
+}
+
+/**
+ * A real-SQL D1 stand-in over bun:sqlite — the ordering and lazy-schema
+ * behaviour under test IS the SQL, which a canned fake cannot exercise.
+ */
+function sqliteD1(): D1Database {
+  const db = new Database(':memory:');
+  const runnable = (sql: string, args: unknown[]) => ({
+    all: async <T>() => ({ results: db.query(sql).all(...(args as never[])) as T[] }),
+    run: async () => {
+      db.query(sql).run(...(args as never[]));
+      return {};
+    },
+  });
+  return {
+    prepare: (sql: string) => ({
+      ...runnable(sql, []),
+      bind: (...args: unknown[]) => runnable(sql, args),
+    }),
+    exec: async (sql: string) => db.exec(sql),
+    batch: async (statements: Array<{ run: () => Promise<unknown> }>) => {
+      for (const s of statements) await s.run();
+      return [];
+    },
+  } as unknown as D1Database;
 }
 
 const STRUCTURED_TURN: ModelMessage[] = [
@@ -241,5 +269,47 @@ describe('EpisodicMemory round-trips structured content', () => {
     const loaded = await new EpisodicMemory(db).load('agent', 'thread');
     expect(loaded[0]).toEqual({ role: 'user', content: quoted });
     expect(loaded[1]).toEqual({ role: 'user', content: '[{"type":"book","title":"Dune"}]' });
+  });
+});
+
+describe('EpisodicMemory against real SQL (bun:sqlite)', () => {
+  it('creates its schema lazily — no explicit init() required', async () => {
+    const memory = new EpisodicMemory(sqliteD1());
+    // First contact with a fresh D1 binding must not throw "no such table".
+    expect(await memory.load('agent', 'thread')).toEqual([]);
+    await memory.append('agent', 'thread', [{ role: 'user', content: 'hello' }]);
+    expect(await memory.load('agent', 'thread')).toEqual([{ role: 'user', content: 'hello' }]);
+  });
+
+  it('load returns the NEWEST limit messages, in chronological order', async () => {
+    // A plain ASC LIMIT returns the OLDEST rows: once a thread outgrows the
+    // limit, recent turns never enter the context and the window freezes on
+    // the first N rows forever.
+    const memory = new EpisodicMemory(sqliteD1());
+    const messages: ModelMessage[] = Array.from({ length: 60 }, (_, i) => ({
+      role: 'user' as const,
+      content: `m${i + 1}`,
+    }));
+    await memory.append('agent', 'thread', messages);
+
+    const loaded = await memory.load('agent', 'thread', 50);
+    expect(loaded).toHaveLength(50);
+    expect(loaded[0]).toEqual({ role: 'user', content: 'm11' });
+    expect(loaded[49]).toEqual({ role: 'user', content: 'm60' });
+  });
+
+  it('scopes load to the requested agent and thread', async () => {
+    const memory = new EpisodicMemory(sqliteD1());
+    await memory.append('agent', 'thread-a', [{ role: 'user', content: 'a' }]);
+    await memory.append('agent', 'thread-b', [{ role: 'user', content: 'b' }]);
+    expect(await memory.load('agent', 'thread-a')).toEqual([{ role: 'user', content: 'a' }]);
+  });
+});
+
+describe('corrupt marker rows', () => {
+  it('degrades to the JSON text without leaking the encoding prefix', async () => {
+    const { db } = fakeD1([{ role: 'assistant', content: 'honi::parts::{not json' }]);
+    const loaded = await new EpisodicMemory(db).load('agent', 'thread');
+    expect(loaded[0]).toEqual({ role: 'assistant', content: '{not json' });
   });
 });
