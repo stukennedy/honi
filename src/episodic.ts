@@ -91,6 +91,16 @@ function parseStructuredContent(raw: string): string | Array<Record<string, unkn
   return parseLegacyParts(raw) ?? raw;
 }
 
+/**
+ * Decode a column that must stay STRING-valued (system rows, and the
+ * unknown-role fallback). `encodeContent` escapes marker-looking strings for
+ * every role, so string-only rows still need the text-marker unescape — but
+ * never the parts decoding.
+ */
+function decodeTextContent(raw: string): string {
+  return raw.startsWith(TEXT_MARKER) ? raw.slice(TEXT_MARKER.length) : raw;
+}
+
 function toMessage(r: { role: string; content: string }): ModelMessage {
   switch (r.role) {
     case 'user':
@@ -112,9 +122,9 @@ function toMessage(r: { role: string; content: string }): ModelMessage {
       return upgradeLegacyMessage({ role: 'tool', content } as ModelMessage);
     }
     case 'system':
-      return { role: 'system', content: r.content };
+      return { role: 'system', content: decodeTextContent(r.content) };
     default:
-      return { role: 'user', content: r.content };
+      return { role: 'user', content: decodeTextContent(r.content) };
   }
 }
 

@@ -155,6 +155,24 @@ describe('EpisodicMemory round-trips structured content', () => {
     }
   });
 
+  it('round-trips system messages whose text needs marker escaping', async () => {
+    const awkward = [
+      'honi::text::not actually escaped',
+      'honi::parts::[]',
+      '[{"type":"text","text":"quoted"}]',
+    ];
+    const { db } = fakeD1();
+    const memory = new EpisodicMemory(db);
+    await memory.append(
+      'agent',
+      'thread',
+      awkward.map((content) => ({ role: 'system' as const, content })),
+    );
+
+    const loaded = await memory.load('agent', 'thread');
+    expect(loaded).toEqual(awkward.map((content) => ({ role: 'system', content })));
+  });
+
   it('treats legacy bare-JSON rows with unknown part types as text', async () => {
     // Pre-marker rows are decoded by shape, but ONLY for known part types.
     const { db } = fakeD1([
