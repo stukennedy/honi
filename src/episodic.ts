@@ -82,7 +82,10 @@ function encodeContent(content: ModelMessage['content']): string {
   return content;
 }
 
-function parseStructuredContent(raw: string): string | Array<Record<string, unknown>> {
+function parseStructuredContent(
+  raw: string,
+  opts: { legacyParts: boolean },
+): string | Array<Record<string, unknown>> {
   if (raw.startsWith(PARTS_MARKER)) {
     try {
       return JSON.parse(raw.slice(PARTS_MARKER.length), binaryReviver) as Array<
@@ -93,7 +96,12 @@ function parseStructuredContent(raw: string): string | Array<Record<string, unkn
     }
   }
   if (raw.startsWith(TEXT_MARKER)) return raw.slice(TEXT_MARKER.length);
-  return parseLegacyParts(raw) ?? raw;
+  // Legacy inference is a per-ROLE decision: pre-marker assistant and tool
+  // rows genuinely stored bare JSON parts (the agent wrote them that way),
+  // but user rows written through the agent were ALWAYS plain strings — a
+  // pre-marker user row that LOOKS like parts is a person who typed JSON,
+  // and unquoting it would corrupt (or invalidate) their message.
+  return (opts.legacyParts ? parseLegacyParts(raw) : undefined) ?? raw;
 }
 
 /**
@@ -111,15 +119,15 @@ function toMessage(r: { role: string; content: string }): ModelMessage {
     case 'user':
       return upgradeLegacyMessage({
         role: 'user',
-        content: parseStructuredContent(r.content),
+        content: parseStructuredContent(r.content, { legacyParts: false }),
       } as ModelMessage);
     case 'assistant':
       return upgradeLegacyMessage({
         role: 'assistant',
-        content: parseStructuredContent(r.content),
+        content: parseStructuredContent(r.content, { legacyParts: true }),
       } as ModelMessage);
     case 'tool': {
-      const content = parseStructuredContent(r.content);
+      const content = parseStructuredContent(r.content, { legacyParts: true });
       // A tool message REQUIRES parts on AI SDK 5+; an unparseable tool row
       // keeps the pre-0.9 fallback (user text) rather than failing prompt
       // validation for the whole thread.

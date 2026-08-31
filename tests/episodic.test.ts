@@ -230,12 +230,16 @@ describe('EpisodicMemory round-trips structured content', () => {
     expect(modelMessageSchema.safeParse(loaded[0]).success).toBe(true);
   });
 
-  it('treats legacy bare-JSON rows with unknown part types as text', async () => {
-    // Pre-marker rows are decoded by shape, but ONLY for known part types.
+  it('never applies legacy parts inference to user rows', async () => {
+    // Pre-marker user rows written through the agent were always plain
+    // strings — a user row that LOOKS like parts is a person who typed JSON.
+    const quoted = '[{"type":"text","text":"hi"}]';
     const { db } = fakeD1([
+      { role: 'user', content: quoted },
       { role: 'user', content: '[{"type":"book","title":"Dune"}]' },
     ]);
     const loaded = await new EpisodicMemory(db).load('agent', 'thread');
-    expect(loaded[0]).toEqual({ role: 'user', content: '[{"type":"book","title":"Dune"}]' });
+    expect(loaded[0]).toEqual({ role: 'user', content: quoted });
+    expect(loaded[1]).toEqual({ role: 'user', content: '[{"type":"book","title":"Dune"}]' });
   });
 });
