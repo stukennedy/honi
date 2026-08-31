@@ -2,18 +2,48 @@ import type { ModelMessage } from 'ai';
 import { upgradeLegacyMessage } from './memory.js';
 
 /**
- * Recover structured message content from the TEXT column. `append` persists
- * parts arrays as JSON — assistant messages ALWAYS carry parts arrays on
- * AI SDK 5+ — so returning the raw column as plain text would hand the model
- * its own previous answer as literal `[{"type":"text",...}]`, and tool calls
- * (with their Gemini thought signatures) would never replay as parts.
+ * Content encoding for the TEXT column.
  *
- * Only a JSON array whose every element is a `{ type: string }` object is
- * treated as parts; anything else (including user text that merely starts
- * with `[`) stays the plain string it always was.
+ * `append` persists parts arrays as JSON — assistant messages ALWAYS carry
+ * parts arrays on AI SDK 5+ — so returning the raw column as plain text would
+ * hand the model its own previous answer as literal `[{"type":"text",...}]`,
+ * and tool calls (with their Gemini thought signatures) would never replay
+ * as parts.
+ *
+ * Structured rows are prefixed with an explicit marker so decoding never has
+ * to GUESS whether a string is quoted JSON or parts: a user can legitimately
+ * send the literal text `[{"type":"text","text":"hi"}]`, and inferring from
+ * shape alone would silently turn that quoted text into message content — or
+ * worse, turn `[{"type":"book",...}]` into invalid parts that fail prompt
+ * validation on every subsequent turn of the thread. Plain strings that
+ * start with a marker (or that the LEGACY fallback below would misread) are
+ * escaped behind the text marker, so the encoding is collision-free for
+ * everything written from here on.
  */
-function parseStructuredContent(raw: string): string | Array<Record<string, unknown>> {
-  if (!raw.startsWith('[')) return raw;
+const PARTS_MARKER = 'honi::parts::';
+const TEXT_MARKER = 'honi::text::';
+
+/** Part types honidev has ever persisted (v4 and v5+ vocabularies). */
+const KNOWN_PART_TYPES = new Set([
+  'text',
+  'image',
+  'file',
+  'reasoning',
+  'redacted-reasoning',
+  'tool-call',
+  'tool-result',
+  'tool-approval-request',
+  'tool-approval-response',
+]);
+
+/**
+ * The pre-marker heuristic, kept ONLY for rows written before the marker
+ * existed (honidev <= 0.9.0 stored bare JSON): a JSON array whose every
+ * element is an object with a KNOWN part type. Unknown types stay text —
+ * `[{"type":"book",...}]` is user data, not message parts.
+ */
+function parseLegacyParts(raw: string): Array<Record<string, unknown>> | undefined {
+  if (!raw.startsWith('[')) return undefined;
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (
@@ -23,7 +53,8 @@ function parseStructuredContent(raw: string): string | Array<Record<string, unkn
         (part) =>
           part !== null &&
           typeof part === 'object' &&
-          typeof (part as { type?: unknown }).type === 'string',
+          typeof (part as { type?: unknown }).type === 'string' &&
+          KNOWN_PART_TYPES.has((part as { type: string }).type),
       )
     ) {
       return parsed as Array<Record<string, unknown>>;
@@ -31,7 +62,33 @@ function parseStructuredContent(raw: string): string | Array<Record<string, unkn
   } catch {
     // Plain text that happens to start with '[' — keep it as text.
   }
-  return raw;
+  return undefined;
+}
+
+function encodeContent(content: ModelMessage['content']): string {
+  if (typeof content !== 'string') return PARTS_MARKER + JSON.stringify(content);
+  // Escape any string the decoder could misread: marker prefixes, and text
+  // the legacy fallback would parse as parts.
+  if (
+    content.startsWith(PARTS_MARKER) ||
+    content.startsWith(TEXT_MARKER) ||
+    parseLegacyParts(content) !== undefined
+  ) {
+    return TEXT_MARKER + content;
+  }
+  return content;
+}
+
+function parseStructuredContent(raw: string): string | Array<Record<string, unknown>> {
+  if (raw.startsWith(PARTS_MARKER)) {
+    try {
+      return JSON.parse(raw.slice(PARTS_MARKER.length)) as Array<Record<string, unknown>>;
+    } catch {
+      return raw;
+    }
+  }
+  if (raw.startsWith(TEXT_MARKER)) return raw.slice(TEXT_MARKER.length);
+  return parseLegacyParts(raw) ?? raw;
 }
 
 function toMessage(r: { role: string; content: string }): ModelMessage {
@@ -94,7 +151,7 @@ export class EpisodicMemory {
         agentName,
         threadId,
         m.role,
-        typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+        encodeContent(m.content),
         now + i,
       ),
     );

@@ -131,4 +131,36 @@ describe('EpisodicMemory round-trips structured content', () => {
     expect(loaded[0]).toEqual({ role: 'user', content: 'corrupt garbage' });
     expect(modelMessageSchema.safeParse(loaded[0]).success).toBe(true);
   });
+
+  it('never mistakes user JSON for message parts (marker-encoded rows)', async () => {
+    // The trap: shape inference alone would turn quoted JSON into content —
+    // invalid parts for unknown types, silent unquoting for valid ones.
+    const quotedJson = [
+      '[{"type":"book","title":"Dune"}]',
+      '[{"type":"text","text":"hi"}]',
+      'honi::parts::[{"type":"text","text":"spoof"}]',
+    ];
+    const { db } = fakeD1();
+    const memory = new EpisodicMemory(db);
+    await memory.append(
+      'agent',
+      'thread',
+      quotedJson.map((content) => ({ role: 'user' as const, content })),
+    );
+
+    const loaded = await memory.load('agent', 'thread');
+    expect(loaded).toEqual(quotedJson.map((content) => ({ role: 'user', content })));
+    for (const message of loaded) {
+      expect(modelMessageSchema.safeParse(message).success).toBe(true);
+    }
+  });
+
+  it('treats legacy bare-JSON rows with unknown part types as text', async () => {
+    // Pre-marker rows are decoded by shape, but ONLY for known part types.
+    const { db } = fakeD1([
+      { role: 'user', content: '[{"type":"book","title":"Dune"}]' },
+    ]);
+    const loaded = await new EpisodicMemory(db).load('agent', 'thread');
+    expect(loaded[0]).toEqual({ role: 'user', content: '[{"type":"book","title":"Dune"}]' });
+  });
 });
