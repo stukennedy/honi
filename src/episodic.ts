@@ -1,5 +1,5 @@
 import type { ModelMessage } from 'ai';
-import { upgradeLegacyMessage } from './memory.js';
+import { binaryReplacer, binaryReviver, upgradeLegacyMessage } from './memory.js';
 
 /**
  * Content encoding for the TEXT column.
@@ -66,7 +66,10 @@ function parseLegacyParts(raw: string): Array<Record<string, unknown>> | undefin
 }
 
 function encodeContent(content: ModelMessage['content']): string {
-  if (typeof content !== 'string') return PARTS_MARKER + JSON.stringify(content);
+  // Binary part data (Uint8Array/ArrayBuffer in file and image parts) rides
+  // the replacer/reviver pair — plain JSON.stringify would mangle it into a
+  // numeric-keyed object that fails prompt validation after decoding.
+  if (typeof content !== 'string') return PARTS_MARKER + JSON.stringify(content, binaryReplacer);
   // Escape any string the decoder could misread: marker prefixes, and text
   // the legacy fallback would parse as parts.
   if (
@@ -82,7 +85,9 @@ function encodeContent(content: ModelMessage['content']): string {
 function parseStructuredContent(raw: string): string | Array<Record<string, unknown>> {
   if (raw.startsWith(PARTS_MARKER)) {
     try {
-      return JSON.parse(raw.slice(PARTS_MARKER.length)) as Array<Record<string, unknown>>;
+      return JSON.parse(raw.slice(PARTS_MARKER.length), binaryReviver) as Array<
+        Record<string, unknown>
+      >;
     } catch {
       return raw;
     }

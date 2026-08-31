@@ -173,6 +173,30 @@ describe('EpisodicMemory round-trips structured content', () => {
     expect(loaded).toEqual(awkward.map((content) => ({ role: 'system', content })));
   });
 
+  it('round-trips binary file-part data losslessly', async () => {
+    const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 255]);
+    const withFile: ModelMessage[] = [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'what is in this image?' },
+          { type: 'file', mediaType: 'image/png', data: bytes },
+        ],
+      },
+    ];
+    const { db } = fakeD1();
+    const memory = new EpisodicMemory(db);
+    await memory.append('agent', 'thread', withFile);
+
+    const loaded = await memory.load('agent', 'thread');
+    const filePart = (loaded[0].content as Array<Record<string, unknown>>)[1] as {
+      data: Uint8Array;
+    };
+    expect(filePart.data).toBeInstanceOf(Uint8Array);
+    expect([...filePart.data]).toEqual([...bytes]);
+    expect(modelMessageSchema.safeParse(loaded[0]).success).toBe(true);
+  });
+
   it('treats legacy bare-JSON rows with unknown part types as text', async () => {
     // Pre-marker rows are decoded by shape, but ONLY for known part types.
     const { db } = fakeD1([
