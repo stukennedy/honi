@@ -45,11 +45,12 @@ export { createMcpServer, toolsToMcp, MCP_ERRORS } from './mcp.js';
 export type { McpServer, McpRequest, McpResponse, McpToolInfo } from './mcp.js';
 
 // Multi-Agent Orchestration
-export { 
-  routeToAgent, 
-  getAgentHistory, 
-  clearAgentHistory, 
-  callAgentTool, 
-  listAgentTools 
+export {
+  routeToAgent,
+  getAgentHistory,
+  clearAgentHistory,
+  callAgentTool,
+  listAgentTools,
+  parseUiMessageStreamText,
 } from './multiagent.js';
 export type { AgentReference, AgentMessage, AgentResponse } from './multiagent.js';
