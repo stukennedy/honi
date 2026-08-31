@@ -205,6 +205,10 @@ export type ModelSettingJson =
 export interface ModelSettings {
   /** Maximum number of output (completion) tokens to generate. */
   maxOutputTokens?: number;
+  /** @deprecated Use `maxOutputTokens`. Mapped automatically when set. */
+  maxTokens?: number;
+  /** @deprecated Tool-call streaming is always on in AI SDK 5+. Ignored. */
+  toolCallStreaming?: boolean;
   temperature?: number;
   topP?: number;
   topK?: number;
@@ -215,6 +219,35 @@ export interface ModelSettings {
   maxRetries?: number;
   /** Provider namespace → options, passed through without interpretation. */
   providerOptions?: Record<string, Record<string, ModelSettingJson>>;
+}
+
+let legacyMaxTokensWarned = false;
+
+/**
+ * Map pre-0.9 setting names onto their AI SDK 5+ equivalents.
+ *
+ * This exists for consumers whose settings do NOT flow through TypeScript —
+ * `ModelSettingJson` explicitly supports settings deserialized from JSON
+ * config, and a leftover `maxTokens` there would otherwise be passed to the
+ * SDK as an unknown key and silently ignored, removing the output cap
+ * entirely. `toolCallStreaming` is stripped rather than forwarded because
+ * tool-call streaming is unconditional in AI SDK 5+.
+ */
+export function normalizeModelSettings(settings: ModelSettings): ModelSettings;
+export function normalizeModelSettings(settings?: ModelSettings): ModelSettings | undefined;
+export function normalizeModelSettings(settings?: ModelSettings): ModelSettings | undefined {
+  if (!settings) return settings;
+  const { maxTokens, toolCallStreaming: _toolCallStreaming, ...rest } = settings;
+  if (maxTokens !== undefined) {
+    if (!legacyMaxTokensWarned) {
+      legacyMaxTokensWarned = true;
+      console.warn(
+        '[honidev] modelSettings.maxTokens is deprecated — use maxOutputTokens. Mapping it for this process.',
+      );
+    }
+    if (rest.maxOutputTokens === undefined) rest.maxOutputTokens = maxTokens;
+  }
+  return rest;
 }
 
 export interface CacheConfig {

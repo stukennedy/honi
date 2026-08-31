@@ -14,6 +14,7 @@
 import { generateText, isStepCount, tool } from 'ai';
 import type { LanguageModel } from 'ai';
 import { z } from 'zod';
+import { normalizeModelSettings } from './types.js';
 import type { ModelSettings, RecursiveConfig } from './types.js';
 
 const DEFAULT_CHUNK_SIZE = 800;
@@ -265,7 +266,7 @@ export class RecursiveMemory {
     ].filter(Boolean).join('\n\n');
 
     const { text } = await generateText({
-      ...modelSettings,
+      ...normalizeModelSettings(modelSettings),
       model,
       instructions: combinedSystem,
       messages: [{ role: 'user', content: userMessage }],

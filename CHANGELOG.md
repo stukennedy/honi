@@ -27,13 +27,22 @@ entirely, forcing honidev to patch request bodies in a fetch wrapper. On
 
 - **Wire format:** `/chat` now streams the AI SDK UI message stream (SSE),
   consumed by `useChat()` from `@ai-sdk/react`. Consumers of the old v4 data
-  protocol (`0:`/`9:`/`3:` frames) must migrate.
-- **`ModelSettings.maxTokens` → `maxOutputTokens`.**
-- **`ModelSettings.toolCallStreaming` removed** — tool-call streaming is
-  always on in AI SDK 5+.
+  protocol (`0:`/`9:`/`3:` frames) must migrate. Per-turn token usage rides
+  the finish frame's `messageMetadata` (`{ usage, finishReason }`).
+- **`ModelSettings.maxTokens` → `maxOutputTokens`.** Deprecated, not removed:
+  a leftover `maxTokens` (e.g. from JSON-driven config) is mapped onto
+  `maxOutputTokens` with a one-time warning rather than silently dropped —
+  losing the output cap without a sound would be an unbounded-cost bug.
+- **`ModelSettings.toolCallStreaming` deprecated and ignored** — tool-call
+  streaming is always on in AI SDK 5+. The key is stripped before reaching
+  the SDK.
 - **Message type:** honidev's memory APIs (`ThreadMemory`, `EpisodicMemory`)
-  now type messages as `ModelMessage` (was `CoreMessage`). Stored threads are
-  compatible; this is a type-level rename.
+  now type messages as `ModelMessage` (was `CoreMessage`). Stored 0.8.x
+  threads are upgraded ON LOAD (`upgradeLegacyMessage`): AI SDK 7 VALIDATES
+  message shapes where v4 never did, so a stored v4 tool turn (`args`,
+  `result`/`isError`) would otherwise throw `InvalidPromptError` on every
+  subsequent turn of the thread. System messages seeded into history remain
+  legal via `allowSystemInMessages`.
 - **Peer dependencies:** optional provider packages must be on their AI SDK
   5-compatible majors (`@ai-sdk/groq@^4`, `@ai-sdk/deepseek@^3`, …); `zod`
   minimum is 3.25.76.
@@ -57,10 +66,30 @@ entirely, forcing honidev to patch request bodies in a fetch wrapper. On
   `@ai-sdk/google@4` accepts `thinkingLevel` via providerOptions: the
   empty-stream retry escalation switches configs per request, which a static
   providerOptions value cannot express.
-- **A persistence failure still fails the turn.** AI SDK 7 swallows `onEnd`
-  callback errors; honidev captures them and errors the response body at
-  close, so a consumer is never handed a turn labelled success whose memory
-  write was silently lost.
+- **Tool execution failures still fail the turn (0.8.x parity).** AI SDK 5+
+  converts a tool handler throw into a `tool-error` part and keeps the loop
+  running — the model would recover in prose, the broken turn would persist
+  to memory, and turn-level telemetry would report success. honidev restores
+  the old contract: the loop stops after the failed step (no further model
+  calls billed), nothing is persisted, `agent.turn.complete` reports
+  `failed`, and the client receives a formatted error naming the tool
+  (`ToolExecutionError:<tool>: <message>` — the SDK's own ToolExecutionError
+  class was removed, so honidev ships its replacement).
+- **A failed turn is never finalized on the wire.** The terminal `finish`
+  part is held until the turn's fate is known (the SDK settles `onEnd` —
+  where persistence runs — before closing the stream): a failed turn gets an
+  `error` frame in place of `finish` and a rejected body, instead of a
+  completed message followed by an inexplicable abort. AI SDK 7 swallows
+  `onEnd` errors entirely; without this a lost memory write looked like a
+  success everywhere but server-side telemetry.
+- **Time-to-first-token telemetry ignores synthetic parts.** AI SDK 7 invokes
+  `onChunk` for bookkeeping parts (`start`, `start-step`) enqueued before any
+  provider I/O; `agent.stream.first_chunk` now latches only on genuine
+  provider output, keeping the TTFT metric honest.
+- **`stream_options` is stripped on the Workers AI binding path.**
+  `@ai-sdk/openai@4` unconditionally adds `stream_options: {include_usage:
+  true}` to streaming bodies (the v4-era `compatibility` opt-out is gone),
+  and the partner endpoint's strict schema 400s on unexpected keys.
 
 ## 0.8.5 — 2026-08-28
 

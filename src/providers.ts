@@ -616,9 +616,17 @@ export async function resolveModel(modelId: string, options?: ProviderOptions): 
     if (!ai) throw new Error('Workers AI requires an AI binding. Add [ai] binding = "AI" to wrangler.toml');
     const binding = ai as Ai;
     const bindingFetch: typeof fetch = async (_url, init) => {
-      const { model: _model, stream, ...payload } = JSON.parse(String(init?.body ?? '{}')) as {
+      // `stream_options` must not reach the binding: @ai-sdk/openai now adds
+      // `stream_options: {include_usage: true}` to every streaming body (the
+      // v4-era `compatibility: 'compatible'` opt-out is gone), and the partner
+      // endpoint's strict schema rejects unexpected payload keys with the same
+      // 400 "User Input Error" this branch exists to avoid.
+      const { model: _model, stream, stream_options: _streamOptions, ...payload } = JSON.parse(
+        String(init?.body ?? '{}'),
+      ) as {
         model?: string;
         stream?: boolean;
+        stream_options?: unknown;
         [key: string]: unknown;
       };
       const result = await binding.run(

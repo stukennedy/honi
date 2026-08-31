@@ -11,6 +11,7 @@ import {
 } from 'ai';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import type { ObservabilityCollector } from './observability.js';
+import { normalizeModelSettings } from './types.js';
 import type { ToolContext, ToolDefinition } from './types.js';
 import type { ModelSettings } from './types.js';
 
@@ -69,9 +70,38 @@ function formatNamedToolError(error: Error & { toolName: string }): string {
   return `${error.name.replace(/^AI_/, '')}:${error.toolName}: ${error.message}`;
 }
 
+/**
+ * A tool handler failure, annotated with WHICH tool failed.
+ *
+ * AI SDK 5+ removed its own ToolExecutionError: a handler throw becomes a
+ * `tool-error` stream part carrying the raw error, and the UI-stream error
+ * formatter receives only `part.error` — no tool name. Without this wrapper
+ * every tool failure reaches the client as the anonymous fallback string.
+ */
+export class ToolExecutionError extends Error {
+  readonly toolName: string;
+
+  constructor(options: { toolName: string; cause: unknown }) {
+    const reason =
+      options.cause instanceof Error ? options.cause.message : String(options.cause);
+    super(reason, { cause: options.cause });
+    this.name = 'ToolExecutionError';
+    this.toolName = options.toolName;
+  }
+
+  static isInstance(error: unknown): error is ToolExecutionError {
+    return (
+      error instanceof Error &&
+      error.name === 'ToolExecutionError' &&
+      typeof (error as { toolName?: unknown }).toolName === 'string'
+    );
+  }
+}
+
 export function formatToolError(error: unknown): string {
   const pending: unknown[] = [error];
   const seen = new Set<unknown>();
+  let executionError: (Error & { toolName: string }) | undefined;
 
   while (pending.length > 0) {
     const current = pending.shift();
@@ -81,13 +111,14 @@ export function formatToolError(error: unknown): string {
     if (InvalidToolInputError.isInstance(current) || NoSuchToolError.isInstance(current)) {
       return formatNamedToolError(current);
     }
+    if (ToolExecutionError.isInstance(current)) executionError ??= current;
     if (ToolCallRepairError.isInstance(current)) pending.push(current.originalError);
     if (typeof current === 'object' && 'cause' in current) {
       pending.push((current as { cause?: unknown }).cause);
     }
   }
 
-  return 'An error occurred.';
+  return executionError ? formatNamedToolError(executionError) : 'An error occurred.';
 }
 
 async function executeHandler(
@@ -98,7 +129,13 @@ async function executeHandler(
   agentName: string,
   threadId: string | undefined,
 ): Promise<unknown> {
-  if (!collector) return definition.handler(args, context);
+  if (!collector) {
+    try {
+      return await definition.handler(args, context);
+    } catch (error) {
+      throw new ToolExecutionError({ toolName: definition.name, cause: error });
+    }
+  }
 
   const start = Date.now();
   collector.emit({
@@ -134,11 +171,13 @@ async function executeHandler(
       durationMs: Date.now() - start,
       metadata: {
         tool: definition.name,
+        // The ORIGINAL error's class — the wrapper below is transport, and
+        // telemetry consumers group failures by what actually threw.
         outcome: 'failed',
         errorType: error instanceof Error ? error.name : 'UnknownError',
       },
     });
-    throw error;
+    throw new ToolExecutionError({ toolName: definition.name, cause: error });
   }
 }
 
@@ -187,9 +226,12 @@ export function buildToolRuntime(input: {
         'Return corrected arguments only.',
       ].join(' ');
       const repair = await generateText({
-        ...input.modelSettings,
+        ...normalizeModelSettings(input.modelSettings),
         model: input.model,
         ...(instructions === undefined ? {} : { instructions }),
+        // Step messages can carry a persisted system row when the main call
+        // allowed one; the repair call must not choke on the same history.
+        allowSystemInMessages: true,
         messages: [
           ...messages,
           {
