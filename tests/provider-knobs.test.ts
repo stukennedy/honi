@@ -56,6 +56,57 @@ describe('ThreadMemory tolerates unclonable decoration on messages', () => {
     await memory.append([message]);
     expect(await memory.load()).toEqual([message]);
   });
+
+  it('preserves binary file-part data through the clone-safety round-trip', async () => {
+    // Plain JSON.stringify mangles a Uint8Array into a numeric-keyed object,
+    // which the AI SDK then rejects as a malformed part on the next turn.
+    const memory = new ThreadMemory(createMockStorage());
+    const bytes = new Uint8Array([1, 2, 3, 250, 255]);
+    await memory.append([
+      {
+        role: 'user',
+        content: [{ type: 'file', mediaType: 'image/png', data: bytes }],
+      } as any,
+    ]);
+
+    const loaded = (await memory.load()) as any[];
+    expect(loaded[0].content[0].data).toBeInstanceOf(Uint8Array);
+    expect([...loaded[0].content[0].data]).toEqual([...bytes]);
+  });
+
+  it('preserves Buffer-backed part data (toJSON runs before the replacer)', async () => {
+    // Buffer serializes ITSELF to {type:'Buffer',data:[...]} before any
+    // replacer runs; the replacer must detect binary on the holder's
+    // original value, not the toJSON output.
+    const memory = new ThreadMemory(createMockStorage());
+    const bytes = Buffer.from([9, 8, 7, 6]);
+    await memory.append([
+      {
+        role: 'user',
+        content: [{ type: 'file', mediaType: 'application/pdf', data: bytes }],
+      } as any,
+    ]);
+
+    const loaded = (await memory.load()) as any[];
+    expect(loaded[0].content[0].data).toBeInstanceOf(Uint8Array);
+    expect([...loaded[0].content[0].data]).toEqual([9, 8, 7, 6]);
+  });
+
+  it('leaves envelope-shaped application data alone', async () => {
+    // Tool args are arbitrary JSON — data that mimics the internal binary
+    // envelope must survive the round-trip as the same object.
+    const memory = new ThreadMemory(createMockStorage());
+    const args = { __honi_binary__: 'u8', b64: 'not base64 at all' };
+    await memory.append([
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'c', toolName: 'export', input: args }],
+      } as any,
+    ]);
+
+    const loaded = (await memory.load()) as any[];
+    expect(loaded[0].content[0].input).toEqual(args);
+  });
 });
 
 describe('direct-API providers fail loudly on a missing key', () => {

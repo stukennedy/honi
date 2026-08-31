@@ -1,6 +1,113 @@
 import type { ModelMessage } from 'ai';
 
 /**
+ * JSON replacer/reviver pair that carries binary message data losslessly.
+ *
+ * File and image parts hold `Uint8Array`/`ArrayBuffer` data, which
+ * `JSON.stringify` mangles into a numeric-keyed object or `{}` — a decoder
+ * that restores structure then hands the AI SDK a malformed part that fails
+ * prompt validation. Both persistence paths (episodic's TEXT column and
+ * ThreadMemory's clone-safety round-trip) serialize through JSON, so both
+ * route through this pair.
+ */
+const BINARY_TAG = '__honi_binary__';
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 8192) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+  }
+  return btoa(binary);
+}
+
+function fromBase64(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+/**
+ * Application data can legitimately contain a `__honi_binary__` key (tool
+ * inputs and outputs are arbitrary JSON), so the envelope must be
+ * collision-safe: ordinary objects carrying a sentinel-shaped key get that
+ * key space-prefixed on write and un-prefixed on read (already-prefixed keys
+ * gain another space, so nesting and repeats stay reversible). The scheme is
+ * stateless — the same replacer can serialize the same object twice.
+ */
+const SENTINEL_KEY_PATTERN = /^ *__honi_binary__$/;
+
+function isBinaryEnvelope(value: object): value is { [BINARY_TAG]: 'u8' | 'ab'; b64: string } {
+  const record = value as Record<string, unknown>;
+  return (
+    Object.keys(record).length === 2 &&
+    (record[BINARY_TAG] === 'u8' || record[BINARY_TAG] === 'ab') &&
+    typeof record.b64 === 'string'
+  );
+}
+
+export function binaryReplacer(this: unknown, key: string, value: unknown): unknown {
+  // JSON.stringify applies toJSON BEFORE the replacer — a Node-compatible
+  // Buffer (which extends Uint8Array) has already serialized itself to
+  // `{type:'Buffer',data:[...]}` by the time `value` arrives, so binary-ness
+  // must be checked on the ORIGINAL value read off the holder (`this`).
+  const original =
+    this !== null && typeof this === 'object'
+      ? (this as Record<string, unknown>)[key]
+      : value;
+  if (original instanceof Uint8Array) {
+    return { [BINARY_TAG]: 'u8', b64: toBase64(original) };
+  }
+  if (original instanceof ArrayBuffer) {
+    return { [BINARY_TAG]: 'ab', b64: toBase64(new Uint8Array(original)) };
+  }
+  if (ArrayBuffer.isView(original)) {
+    return {
+      [BINARY_TAG]: 'u8',
+      b64: toBase64(new Uint8Array(original.buffer, original.byteOffset, original.byteLength)),
+    };
+  }
+  if (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.keys(value).some((key) => SENTINEL_KEY_PATTERN.test(key))
+  ) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, v]) =>
+        SENTINEL_KEY_PATTERN.test(key) ? [' ' + key, v] : [key, v],
+      ),
+    );
+  }
+  return value;
+}
+
+export function binaryReviver(_key: string, value: unknown): unknown {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return value;
+  if (isBinaryEnvelope(value)) {
+    try {
+      const bytes = fromBase64(value.b64);
+      return value[BINARY_TAG] === 'ab'
+        ? bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+        : bytes;
+    } catch {
+      // Not one of ours after all — leave the object untouched rather than
+      // killing the load.
+      return value;
+    }
+  }
+  const keys = Object.keys(value);
+  if (keys.some((key) => key.startsWith(' ') && SENTINEL_KEY_PATTERN.test(key))) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, v]) =>
+        key.startsWith(' ') && SENTINEL_KEY_PATTERN.test(key) ? [key.slice(1), v] : [key, v],
+      ),
+    );
+  }
+  return value;
+}
+
+/**
  * Upgrade one message persisted by honidev < 0.9 (AI SDK 4 shapes) to the
  * AI SDK 5+ `ModelMessage` shape.
  *
@@ -55,8 +162,13 @@ export class ThreadMemory {
     // invalid-tool-args marker into the assistant message's tool-call args.
     // Messages are provider-wire JSON semantically, so the round-trip is
     // lossless for real content and silently drops only unclonable decoration
-    // instead of killing the turn.
-    await this.storage.put('messages', JSON.parse(JSON.stringify(existing)) as ModelMessage[]);
+    // instead of killing the turn. Binary part data rides the replacer /
+    // reviver pair — plain JSON.stringify would mangle a Uint8Array into a
+    // numeric-keyed object.
+    await this.storage.put(
+      'messages',
+      JSON.parse(JSON.stringify(existing, binaryReplacer), binaryReviver) as ModelMessage[],
+    );
   }
 
   async clear(): Promise<void> {
