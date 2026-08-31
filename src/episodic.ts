@@ -1,12 +1,63 @@
 import type { ModelMessage } from 'ai';
+import { upgradeLegacyMessage } from './memory.js';
+
+/**
+ * Recover structured message content from the TEXT column. `append` persists
+ * parts arrays as JSON — assistant messages ALWAYS carry parts arrays on
+ * AI SDK 5+ — so returning the raw column as plain text would hand the model
+ * its own previous answer as literal `[{"type":"text",...}]`, and tool calls
+ * (with their Gemini thought signatures) would never replay as parts.
+ *
+ * Only a JSON array whose every element is a `{ type: string }` object is
+ * treated as parts; anything else (including user text that merely starts
+ * with `[`) stays the plain string it always was.
+ */
+function parseStructuredContent(raw: string): string | Array<Record<string, unknown>> {
+  if (!raw.startsWith('[')) return raw;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (
+      Array.isArray(parsed) &&
+      parsed.length > 0 &&
+      parsed.every(
+        (part) =>
+          part !== null &&
+          typeof part === 'object' &&
+          typeof (part as { type?: unknown }).type === 'string',
+      )
+    ) {
+      return parsed as Array<Record<string, unknown>>;
+    }
+  } catch {
+    // Plain text that happens to start with '[' — keep it as text.
+  }
+  return raw;
+}
 
 function toMessage(r: { role: string; content: string }): ModelMessage {
-  const content = r.content;
   switch (r.role) {
-    case 'user': return { role: 'user', content };
-    case 'assistant': return { role: 'assistant', content };
-    case 'system': return { role: 'system', content };
-    default: return { role: 'user', content };
+    case 'user':
+      return upgradeLegacyMessage({
+        role: 'user',
+        content: parseStructuredContent(r.content),
+      } as ModelMessage);
+    case 'assistant':
+      return upgradeLegacyMessage({
+        role: 'assistant',
+        content: parseStructuredContent(r.content),
+      } as ModelMessage);
+    case 'tool': {
+      const content = parseStructuredContent(r.content);
+      // A tool message REQUIRES parts on AI SDK 5+; an unparseable tool row
+      // keeps the pre-0.9 fallback (user text) rather than failing prompt
+      // validation for the whole thread.
+      if (typeof content === 'string') return { role: 'user', content };
+      return upgradeLegacyMessage({ role: 'tool', content } as ModelMessage);
+    }
+    case 'system':
+      return { role: 'system', content: r.content };
+    default:
+      return { role: 'user', content: r.content };
   }
 }
 
