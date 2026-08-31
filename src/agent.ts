@@ -1,8 +1,12 @@
 import { Hono } from 'hono';
 import {
+  createUIMessageStreamResponse,
+  isStepCount,
   streamText,
-  type CoreMessage,
+  toUIMessageStream,
+  type ModelMessage,
   type LanguageModel,
+  type SystemModelMessage,
   type ToolCallRepairFunction,
   type ToolSet,
 } from 'ai';
@@ -15,6 +19,7 @@ import { RecursiveMemory } from './recursive.js';
 import { measurePhase, ObservabilityCollector } from './observability.js';
 import { createMcpServer } from './mcp.js';
 import { buildToolRuntime, formatToolError } from './tool-runtime.js';
+import { normalizeModelSettings } from './types.js';
 import type { AgentConfig, ModelSettings, ToolContext } from './types.js';
 
 /**
@@ -39,24 +44,24 @@ function resolveCache(cache: AgentConfig['cache']): {
 /**
  * Assemble a turn's prompt, placing Anthropic cache breakpoints when asked.
  *
- * Returns `system` separately from `messages` because the two are mutually
- * exclusive: caching the system prompt REQUIRES carrying it as a message (the
- * provider reads cache control off `providerOptions`, and a top-level `system`
- * string has nowhere to put it), while leaving caching off must reproduce the
- * previous shape byte-for-byte. `system: undefined` means "it's in `messages`".
+ * `system` is returned separately from `messages` and feeds the model call's
+ * `instructions` option (the AI SDK rejects system messages inside `messages`
+ * by default). Caching the system prompt upgrades it from a plain string to a
+ * full system message: the provider reads cache control off `providerOptions`,
+ * which a bare string has nowhere to carry.
  *
  * Exported for tests — the placement of breakpoints is the whole behaviour, and
  * it is worth asserting without standing up a Durable Object.
  */
 export function buildPrompt(input: {
   systemPrompt: string;
-  history: CoreMessage[];
+  history: ModelMessage[];
   message: string;
   cache: AgentConfig['cache'];
-}): { messages: CoreMessage[]; system: string | undefined } {
+}): { messages: ModelMessage[]; system: string | SystemModelMessage | undefined } {
   const cache = resolveCache(input.cache);
 
-  const turn: CoreMessage[] = [...input.history, { role: 'user' as const, content: input.message }];
+  const turn: ModelMessage[] = [...input.history, { role: 'user' as const, content: input.message }];
 
   // Breakpoint 2 — the conversation prefix up to, but NOT including, this
   // turn's user message. Marking the last message of `history` is what makes
@@ -68,48 +73,96 @@ export function buildPrompt(input: {
     turn[prefixEnd] = {
       ...turn[prefixEnd],
       providerOptions: ANTHROPIC_CACHE_MARK,
-    } as CoreMessage;
+    } as ModelMessage;
   }
 
   // Breakpoint 1 — tools + system, the stable bulk of the prompt. Anthropic
   // serialises tools ahead of system, so this single breakpoint covers both.
   if (input.systemPrompt && cache.system) {
     return {
-      messages: [
-        {
-          role: 'system' as const,
-          content: input.systemPrompt,
-          providerOptions: ANTHROPIC_CACHE_MARK,
-        },
-        ...turn,
-      ],
-      system: undefined,
+      messages: turn,
+      system: {
+        role: 'system' as const,
+        content: input.systemPrompt,
+        providerOptions: ANTHROPIC_CACHE_MARK,
+      },
     };
   }
 
   return { messages: turn, system: input.systemPrompt || undefined };
 }
 
+/**
+ * Stop the tool loop after a step whose tool execution failed.
+ *
+ * AI SDK 5+ turns a tool handler throw into a `tool-error` part and keeps the
+ * loop running — the model gets the error as a result and generates a
+ * recovery. honidev 0.8.x treated a tool failure as fatal to the turn;
+ * continuing to bill further model calls for a turn the agent will report as
+ * failed (and not persist) would be pure waste.
+ */
+export const stopOnToolError = ({
+  steps,
+}: {
+  steps: Array<{ content: Array<{ type: string }> }>;
+}): boolean => steps.at(-1)?.content.some((part) => part.type === 'tool-error') ?? false;
+
 /** Assemble cache-sensitive stream inputs without cloning their stable references. */
 export function buildAgentStreamOptions<TOOLS extends ToolSet>(input: {
   model: LanguageModel;
-  system: string | undefined;
-  messages: CoreMessage[];
+  system: string | SystemModelMessage | undefined;
+  messages: ModelMessage[];
   tools: TOOLS | undefined;
   repairToolCall: ToolCallRepairFunction<TOOLS> | undefined;
   maxSteps: number;
   modelSettings?: ModelSettings;
 }) {
   return {
-    ...input.modelSettings,
+    ...normalizeModelSettings(input.modelSettings),
     model: input.model,
-    ...(input.system === undefined ? {} : { system: input.system }),
+    ...(input.system === undefined ? {} : { instructions: input.system }),
     messages: input.messages,
+    // Persisted history is exactly the "persisted chats" case this opt-in
+    // exists for: a consumer can legally have seeded a system row through
+    // EpisodicMemory.append (its role round-trip supports it explicitly), and
+    // without the flag one such row throws InvalidPromptError on every
+    // subsequent turn of the thread.
+    allowSystemInMessages: true,
     tools: input.tools,
-    maxSteps: input.maxSteps,
-    experimental_repairToolCall: input.repairToolCall,
+    stopWhen: [isStepCount(input.maxSteps), stopOnToolError],
+    repairToolCall: input.repairToolCall,
   };
 }
+
+/**
+ * The concatenated text of an assistant response message. AI SDK 5+ response
+ * messages always carry content as a parts ARRAY (never a bare string), so
+ * any consumer that string-matches `content` sees nothing.
+ */
+export function assistantMessageText(message: ModelMessage): string {
+  if (message.role !== 'assistant') return '';
+  if (typeof message.content === 'string') return message.content;
+  return message.content
+    .map((part) => (part.type === 'text' ? part.text : ''))
+    .join('');
+}
+
+/**
+ * Stream part types that represent PROVIDER OUTPUT. AI SDK 5+ invokes
+ * `onChunk` for every part including the synthetic `start`/`start-step`
+ * bookkeeping enqueued before any provider I/O — latching time-to-first-token
+ * on those reports ~0ms pipeline latency instead of TTFT.
+ */
+const CONTENT_CHUNK_TYPES: ReadonlySet<string> = new Set([
+  'text-delta',
+  'reasoning-delta',
+  'tool-input-start',
+  'tool-input-delta',
+  'tool-call',
+  'tool-result',
+  'file',
+  'source',
+]);
 
 /**
  * Return an error safe to hand to `controller.error()` across a structured-clone
@@ -353,7 +406,7 @@ export function createAgent(config: AgentConfig) {
 
         // Load history: prefer episodic (D1) if available, else DO storage
         const episodicLimit = config.memory?.episodic?.limit ?? 50;
-        let history: CoreMessage[] = [];
+        let history: ModelMessage[] = [];
         if (this.episodic) {
           history = await measurePhase(
             collector,
@@ -515,6 +568,13 @@ export function createAgent(config: AgentConfig) {
 
         const providerStartedAt = Date.now();
         let stepStartedAt = providerStartedAt;
+        // The turn's fatal error, when the AI SDK would otherwise report
+        // success: a tool handler throw (a `tool-error` part in v5+ — the
+        // loop continues and onError never fires) or a persistence failure
+        // inside onEnd (whose errors the SDK swallows). Recorded here;
+        // surfaced by erroring the response body INSTEAD of releasing its
+        // held terminal frame, so the client never finalizes the turn.
+        let turnFailure: unknown;
         const result = await measurePhase(
           collector,
           {
@@ -534,8 +594,9 @@ export function createAgent(config: AgentConfig) {
               maxSteps,
               modelSettings: config.modelSettings,
             }),
-              onChunk: () => {
+              onChunk: ({ chunk }) => {
                 if (firstChunkEmitted || !collector) return;
+                if (!CONTENT_CHUNK_TYPES.has(chunk.type)) return;
                 firstChunkEmitted = true;
                 collector.emit({
                   type: 'agent.stream.first_chunk',
@@ -546,7 +607,14 @@ export function createAgent(config: AgentConfig) {
                   metadata: { outcome: 'first_output', model: config.model },
                 });
               },
-              onStepFinish: ({ finishReason, usage }) => {
+              onStepEnd: ({ content, finishReason, usage }) => {
+                // A tool handler throw is a `tool-error` part in v5+, not a
+                // stream error: onError never fires and the loop would keep
+                // going. Recording it here is what makes the turn FAIL — the
+                // stop condition ends the loop, onEnd skips persistence, and
+                // the response body surfaces the error to the client.
+                const toolError = content.find((part) => part.type === 'tool-error');
+                if (toolError && turnFailure === undefined) turnFailure = toolError.error;
                 const finishedAt = Date.now();
                 collector?.emit({
                   type: 'agent.step',
@@ -558,16 +626,25 @@ export function createAgent(config: AgentConfig) {
                     outcome: 'completed',
                     stepIndex,
                     finishReason,
-                    promptTokens: usage.promptTokens,
-                    completionTokens: usage.completionTokens,
+                    inputTokens: usage.inputTokens,
+                    outputTokens: usage.outputTokens,
                   },
                 });
                 stepIndex += 1;
                 stepStartedAt = finishedAt;
               },
               onError: ({ error }) => emitTerminal(error),
-              onFinish: async ({ response, usage, finishReason, providerMetadata }) => {
+              onEnd: async ({ responseMessages, usage, finalStep }) => {
                 try {
+                  // 0.8.x parity: a failed tool aborted the turn before
+                  // anything was persisted or reported as a response. The
+                  // broken turn must not enter memory — replaying it every
+                  // subsequent turn would teach the model the failure is
+                  // normal, and the user message it answers got no answer.
+                  if (turnFailure !== undefined) {
+                    emitTerminal(turnFailure);
+                    return;
+                  }
                   if (collector) {
                     collector.emit({
                       type: 'agent.response',
@@ -576,22 +653,23 @@ export function createAgent(config: AgentConfig) {
                       timestamp: Date.now(),
                       durationMs: Date.now() - requestStart,
                       // Token usage for cost telemetry. `usage` is the AI SDK's
-                      // promptTokens/completionTokens; `providerMetadata` carries the
-                      // provider-specific buckets (e.g. Anthropic prompt-cache reads/
-                      // writes, which are billed at different rates). Without these the
-                      // agent's spend is invisible to the consumer.
+                      // inputTokens/outputTokens (aggregated across steps, with
+                      // cache reads/writes in inputTokenDetails); the final step's
+                      // providerMetadata carries any remaining provider-specific
+                      // buckets. Without these the agent's spend is invisible to
+                      // the consumer.
                       metadata: {
                         model: config.model,
                         usage,
-                        finishReason,
-                        providerMetadata,
+                        finishReason: finalStep.finishReason,
+                        providerMetadata: finalStep.providerMetadata,
                       },
                     });
                   }
 
-                  const newMessages: CoreMessage[] = [
+                  const newMessages: ModelMessage[] = [
                     { role: 'user' as const, content: body.message },
-                    ...(response.messages as CoreMessage[]),
+                    ...(responseMessages as ModelMessage[]),
                   ];
 
                   // Save to DO working memory
@@ -648,10 +726,13 @@ export function createAgent(config: AgentConfig) {
                           thread: threadId,
                           role: 'user',
                         });
-                        // Index assistant responses
-                        for (const msg of response.messages) {
-                          if (msg.role === 'assistant' && typeof msg.content === 'string') {
-                            await this.semantic!.upsert(crypto.randomUUID(), msg.content, {
+                        // Index assistant responses. v5+ response messages
+                        // carry content as a parts ARRAY, never a bare
+                        // string — string-matching indexes nothing.
+                        for (const msg of responseMessages) {
+                          const text = assistantMessageText(msg);
+                          if (text) {
+                            await this.semantic!.upsert(crypto.randomUUID(), text, {
                               agent: config.name,
                               thread: threadId,
                               role: 'assistant',
@@ -663,8 +744,9 @@ export function createAgent(config: AgentConfig) {
                   }
 
                   // Recursive memory stores its documents in DO storage;
-                  // no per-turn bookkeeping needed in onFinish.
+                  // no per-turn bookkeeping needed in onEnd.
                 } catch (error) {
+                  turnFailure = error;
                   emitTerminal(error);
                   throw error;
                 } finally {
@@ -674,18 +756,66 @@ export function createAgent(config: AgentConfig) {
             }),
         );
 
-        const response = result.toDataStreamResponse({ getErrorMessage: formatToolError });
+        // Hold the terminal `finish` part until the turn's fate is known.
+        // The SDK produces `finish` BEFORE running onEnd (where persistence
+        // failures are recorded) but closes the stream only AFTER onEnd
+        // settles — so by flush time `turnFailure` is authoritative. On a
+        // failed turn the client gets a formatted `error` frame and never a
+        // `finish` frame; without this guard it would render a completed
+        // message and only then see an inexplicable abort.
+        type StreamPart = { type: string; [key: string]: unknown };
+        let heldFinish: StreamPart | undefined;
+        const guardedStream = (result.stream as unknown as ReadableStream<StreamPart>).pipeThrough(
+          new TransformStream<StreamPart, StreamPart>({
+            transform(part, controller) {
+              if (part.type === 'finish') {
+                heldFinish = part;
+                return;
+              }
+              controller.enqueue(part);
+            },
+            flush(controller) {
+              if (turnFailure !== undefined) {
+                controller.enqueue({ type: 'error', error: turnFailure });
+                return;
+              }
+              if (heldFinish !== undefined) controller.enqueue(heldFinish);
+            },
+          }),
+        );
+
+        const response = createUIMessageStreamResponse({
+          stream: toUIMessageStream({
+            stream: guardedStream as never,
+            onError: formatToolError,
+            // v4's data protocol sent token usage in its finish frame by
+            // default; the UI message stream sends only what messageMetadata
+            // supplies. Without this, clients that account spend off the
+            // stream silently read zero after the upgrade.
+            messageMetadata: ({ part }) =>
+              part.type === 'finish'
+                ? { usage: part.totalUsage, finishReason: part.finishReason }
+                : undefined,
+          }),
+        });
         if (!response.body) return response;
 
         // AI SDK/provider adapters do not consistently invoke `onError` for an
         // underlying stream failure. Observe the actual response body as the
-        // final lifecycle boundary so every consumed turn gets one terminal event.
+        // final lifecycle boundary so every consumed turn gets one terminal
+        // event — and reject the body outright on a recorded turn failure,
+        // for consumers that await the whole response rather than frames.
         const reader = response.body.getReader();
         const monitoredBody = new ReadableStream<Uint8Array>({
           async pull(controller) {
             try {
               const next = await reader.read();
               if (next.done) {
+                if (turnFailure !== undefined) {
+                  emitTerminal(turnFailure);
+                  controller.error(toClonableError(turnFailure));
+                  return;
+                }
                 emitTerminal();
                 controller.close();
               } else {

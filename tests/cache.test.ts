@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'bun:test';
-import type { CoreMessage, LanguageModel, ToolCallRepairFunction, ToolSet } from 'ai';
+import type { LanguageModel, ModelMessage, ToolCallRepairFunction, ToolSet } from 'ai';
 import { buildAgentStreamOptions, buildPrompt } from '../src/agent.js';
 
 const SYSTEM = 'You are a helpful assistant with a long, stable system prompt.';
 
-const HISTORY: CoreMessage[] = [
+const HISTORY: ModelMessage[] = [
   { role: 'user', content: 'first question' },
   { role: 'assistant', content: 'first answer' },
   { role: 'user', content: 'second question' },
@@ -15,7 +15,7 @@ const HISTORY: CoreMessage[] = [
 const MARK = { anthropic: { cacheControl: { type: 'ephemeral' } } };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const optionsOf = (m: CoreMessage): unknown => (m as any).providerOptions;
+const optionsOf = (m: unknown): unknown => (m as any)?.providerOptions;
 
 describe('buildPrompt — caching off (default)', () => {
   it('keeps the system prompt on the top-level param, exactly as before', () => {
@@ -52,18 +52,21 @@ describe('buildPrompt — caching off (default)', () => {
 });
 
 describe('buildPrompt — cache: true', () => {
-  it('moves the system prompt into messages and marks it', () => {
-    // The whole point: a top-level `system` STRING cannot carry
-    // providerOptions, so caching it is only possible as a message.
+  it('upgrades the system prompt to a system message carrying the cache mark', () => {
+    // The whole point: a bare `system` STRING cannot carry providerOptions, so
+    // caching it requires the full SystemModelMessage shape (which feeds the
+    // model call's `instructions` option — the AI SDK rejects system messages
+    // inside `messages` by default).
     const { messages, system } = buildPrompt({
       systemPrompt: SYSTEM,
       history: HISTORY,
       message: 'third question',
       cache: true,
     });
-    expect(system).toBeUndefined();
-    expect(messages[0]).toMatchObject({ role: 'system', content: SYSTEM });
-    expect(optionsOf(messages[0])).toEqual(MARK);
+    expect(system).toMatchObject({ role: 'system', content: SYSTEM });
+    expect(optionsOf(system)).toEqual(MARK);
+    expect(messages.every((m) => m.role !== 'system')).toBe(true);
+    expect(messages).toHaveLength(HISTORY.length + 1);
   });
 
   it('marks the END of history, not the new user message', () => {
@@ -85,29 +88,30 @@ describe('buildPrompt — cache: true', () => {
   });
 
   it('uses exactly two breakpoints, leaving room under Anthropic’s limit of 4', () => {
-    const { messages } = buildPrompt({
+    const { messages, system } = buildPrompt({
       systemPrompt: SYSTEM,
       history: HISTORY,
       message: 'third question',
       cache: true,
     });
-    expect(messages.filter((m) => optionsOf(m) !== undefined)).toHaveLength(2);
+    expect(messages.filter((m) => optionsOf(m) !== undefined)).toHaveLength(1);
+    expect(optionsOf(system)).toEqual(MARK);
   });
 
   it('places only the system breakpoint on the first turn of a thread', () => {
-    const { messages } = buildPrompt({
+    const { messages, system } = buildPrompt({
       systemPrompt: SYSTEM,
       history: [],
       message: 'first question',
       cache: true,
     });
-    expect(messages).toHaveLength(2);
-    expect(optionsOf(messages[0])).toEqual(MARK);
-    expect(optionsOf(messages[1])).toBeUndefined();
+    expect(messages).toHaveLength(1);
+    expect(optionsOf(system)).toEqual(MARK);
+    expect(optionsOf(messages[0])).toBeUndefined();
   });
 
   it('does not mutate the caller’s history array', () => {
-    const history: CoreMessage[] = [{ role: 'user', content: 'only' }];
+    const history: ModelMessage[] = [{ role: 'user', content: 'only' }];
     buildPrompt({ systemPrompt: SYSTEM, history, message: 'next', cache: true });
     expect(optionsOf(history[0])).toBeUndefined();
   });
@@ -127,31 +131,32 @@ describe('buildPrompt — per-breakpoint opt-out', () => {
   });
 
   it('cache.history false marks the system prompt only', () => {
-    const { messages } = buildPrompt({
+    const { messages, system } = buildPrompt({
       systemPrompt: SYSTEM,
       history: HISTORY,
       message: 'third question',
       cache: { history: false },
     });
-    expect(messages.filter((m) => optionsOf(m) !== undefined)).toHaveLength(1);
-    expect(messages[0].role).toBe('system');
+    expect(messages.filter((m) => optionsOf(m) !== undefined)).toHaveLength(0);
+    expect(optionsOf(system)).toEqual(MARK);
   });
 
   it('an empty object enables both — a set `cache` opts in by default', () => {
-    const { messages } = buildPrompt({
+    const { messages, system } = buildPrompt({
       systemPrompt: SYSTEM,
       history: HISTORY,
       message: 'third question',
       cache: {},
     });
-    expect(messages.filter((m) => optionsOf(m) !== undefined)).toHaveLength(2);
+    expect(messages.filter((m) => optionsOf(m) !== undefined)).toHaveLength(1);
+    expect(optionsOf(system)).toEqual(MARK);
   });
 });
 
 describe('buildAgentStreamOptions — cache-stable references', () => {
   it('passes system, messages, and tools through without rebuilding them', () => {
     const system = SYSTEM;
-    const messages: CoreMessage[] = [{ role: 'user', content: 'submit ratings' }];
+    const messages: ModelMessage[] = [{ role: 'user', content: 'submit ratings' }];
     const tools: ToolSet = {};
     const repairToolCall = (async () => null) as ToolCallRepairFunction<ToolSet>;
     const model = {} as LanguageModel;
@@ -165,10 +170,10 @@ describe('buildAgentStreamOptions — cache-stable references', () => {
       maxSteps: 3,
     });
 
-    expect(options.system).toBe(system);
+    expect(options.instructions).toBe(system);
     expect(options.messages).toBe(messages);
     expect(options.tools).toBe(tools);
-    expect(options.experimental_repairToolCall).toBe(repairToolCall);
+    expect(options.repairToolCall).toBe(repairToolCall);
   });
 
   it('passes common and provider-specific AI SDK model settings through unchanged', () => {
@@ -178,7 +183,7 @@ describe('buildAgentStreamOptions — cache-stable references', () => {
       openai: { reasoningEffort: 'low' },
     };
     const modelSettings = {
-      maxTokens: 512,
+      maxOutputTokens: 512,
       temperature: 0,
       topP: 0.9,
       topK: 20,
@@ -187,7 +192,6 @@ describe('buildAgentStreamOptions — cache-stable references', () => {
       stopSequences: ['<END>'],
       seed: 42,
       maxRetries: 1,
-      toolCallStreaming: true,
       providerOptions,
     };
 

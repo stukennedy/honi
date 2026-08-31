@@ -11,9 +11,10 @@
  * execute as DO storage reads — sub-millisecond, no network hop.
  */
 
-import { generateText, tool } from 'ai';
+import { generateText, isStepCount, tool } from 'ai';
 import type { LanguageModel } from 'ai';
 import { z } from 'zod';
+import { normalizeModelSettings } from './types.js';
 import type { ModelSettings, RecursiveConfig } from './types.js';
 
 const DEFAULT_CHUNK_SIZE = 800;
@@ -232,7 +233,7 @@ export class RecursiveMemory {
     const rlmTools = {
       search: tool({
         description: 'Search the document store for chunks matching a query. Returns chunk IDs and snippets.',
-        parameters: z.object({
+        inputSchema: z.object({
           query: z.string().describe('Search query — key terms or a phrase'),
           limit: z.number().optional().describe('Max results. Defaults to 10.'),
         }),
@@ -242,7 +243,7 @@ export class RecursiveMemory {
       }),
       read_chunks: tool({
         description: 'Fetch the full text of specific chunks by their IDs.',
-        parameters: z.object({
+        inputSchema: z.object({
           ids: z.array(z.number()).describe('Array of chunk IDs to retrieve'),
         }),
         execute: async ({ ids }) => {
@@ -252,7 +253,7 @@ export class RecursiveMemory {
       }),
       get_index: tool({
         description: 'List all loaded documents with their titles and chunk counts.',
-        parameters: z.object({}),
+        inputSchema: z.object({}),
         execute: async () => {
           return this.getIndex();
         },
@@ -265,12 +266,12 @@ export class RecursiveMemory {
     ].filter(Boolean).join('\n\n');
 
     const { text } = await generateText({
-      ...modelSettings,
+      ...normalizeModelSettings(modelSettings),
       model,
-      system: combinedSystem,
+      instructions: combinedSystem,
       messages: [{ role: 'user', content: userMessage }],
       tools: rlmTools,
-      maxSteps: depth,
+      stopWhen: isStepCount(depth),
       abortSignal: AbortSignal.timeout(deadline - Date.now()),
     });
 

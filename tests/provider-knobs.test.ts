@@ -44,9 +44,10 @@ describe('ThreadMemory tolerates unclonable decoration on messages', () => {
 
     const loaded = (await memory.load()) as any[];
     expect(loaded).toHaveLength(1);
-    // Real content survives; only the unclonable decoration is dropped.
-    expect(loaded[0].content[0].args.ratings[0].skillName).toBe('AI literacy');
-    expect(loaded[0].content[0].args.addIssue).toBeUndefined();
+    // Real content survives; only the unclonable decoration is dropped. The
+    // v4 `args` key is upgraded to the v5+ `input` shape on load.
+    expect(loaded[0].content[0].input.ratings[0].skillName).toBe('AI literacy');
+    expect(loaded[0].content[0].input.addIssue).toBeUndefined();
   });
 
   it('leaves ordinary messages byte-identical', async () => {

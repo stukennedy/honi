@@ -1,10 +1,9 @@
 import {
   generateText,
-  InvalidToolArgumentsError,
+  InvalidToolInputError,
   jsonSchema,
   NoSuchToolError,
   ToolCallRepairError,
-  ToolExecutionError,
   tool as aiTool,
   type LanguageModel,
   type ToolCallRepairFunction,
@@ -12,6 +11,7 @@ import {
 } from 'ai';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import type { ObservabilityCollector } from './observability.js';
+import { normalizeModelSettings } from './types.js';
 import type { ToolContext, ToolDefinition } from './types.js';
 import type { ModelSettings } from './types.js';
 
@@ -70,6 +70,34 @@ function formatNamedToolError(error: Error & { toolName: string }): string {
   return `${error.name.replace(/^AI_/, '')}:${error.toolName}: ${error.message}`;
 }
 
+/**
+ * A tool handler failure, annotated with WHICH tool failed.
+ *
+ * AI SDK 5+ removed its own ToolExecutionError: a handler throw becomes a
+ * `tool-error` stream part carrying the raw error, and the UI-stream error
+ * formatter receives only `part.error` — no tool name. Without this wrapper
+ * every tool failure reaches the client as the anonymous fallback string.
+ */
+export class ToolExecutionError extends Error {
+  readonly toolName: string;
+
+  constructor(options: { toolName: string; cause: unknown }) {
+    const reason =
+      options.cause instanceof Error ? options.cause.message : String(options.cause);
+    super(reason, { cause: options.cause });
+    this.name = 'ToolExecutionError';
+    this.toolName = options.toolName;
+  }
+
+  static isInstance(error: unknown): error is ToolExecutionError {
+    return (
+      error instanceof Error &&
+      error.name === 'ToolExecutionError' &&
+      typeof (error as { toolName?: unknown }).toolName === 'string'
+    );
+  }
+}
+
 export function formatToolError(error: unknown): string {
   const pending: unknown[] = [error];
   const seen = new Set<unknown>();
@@ -80,7 +108,7 @@ export function formatToolError(error: unknown): string {
     if (current === null || current === undefined || seen.has(current)) continue;
     seen.add(current);
 
-    if (InvalidToolArgumentsError.isInstance(current) || NoSuchToolError.isInstance(current)) {
+    if (InvalidToolInputError.isInstance(current) || NoSuchToolError.isInstance(current)) {
       return formatNamedToolError(current);
     }
     if (ToolExecutionError.isInstance(current)) executionError ??= current;
@@ -101,7 +129,13 @@ async function executeHandler(
   agentName: string,
   threadId: string | undefined,
 ): Promise<unknown> {
-  if (!collector) return definition.handler(args, context);
+  if (!collector) {
+    try {
+      return await definition.handler(args, context);
+    } catch (error) {
+      throw new ToolExecutionError({ toolName: definition.name, cause: error });
+    }
+  }
 
   const start = Date.now();
   collector.emit({
@@ -137,11 +171,13 @@ async function executeHandler(
       durationMs: Date.now() - start,
       metadata: {
         tool: definition.name,
+        // The ORIGINAL error's class — the wrapper below is transport, and
+        // telemetry consumers group failures by what actually threw.
         outcome: 'failed',
         errorType: error instanceof Error ? error.name : 'UnknownError',
       },
     });
-    throw error;
+    throw new ToolExecutionError({ toolName: definition.name, cause: error });
   }
 }
 
@@ -161,8 +197,8 @@ export function buildToolRuntime(input: {
     toolCall,
     error,
     messages,
-    system,
-    parameterSchema,
+    instructions,
+    inputSchema,
   }) => {
     if (NoSuchToolError.isInstance(error)) {
       emitRepair(input, error.toolName, 'no-such-tool');
@@ -178,7 +214,7 @@ export function buildToolRuntime(input: {
     try {
       let issues: unknown = [{ message: error.message }];
       try {
-        const rawArgs = JSON.parse(error.toolArgs);
+        const rawArgs = JSON.parse(error.toolInput);
         const validation = definition.input.safeParse(rawArgs);
         if (!validation.success) issues = validation.error.issues;
       } catch {
@@ -190,17 +226,20 @@ export function buildToolRuntime(input: {
         'Return corrected arguments only.',
       ].join(' ');
       const repair = await generateText({
-        ...input.modelSettings,
+        ...normalizeModelSettings(input.modelSettings),
         model: input.model,
-        ...(system === undefined ? {} : { system }),
+        ...(instructions === undefined ? {} : { instructions }),
+        // Step messages can carry a persisted system row when the main call
+        // allowed one; the repair call must not choke on the same history.
+        allowSystemInMessages: true,
         messages: [
           ...messages,
           {
             role: 'user',
             content: [
               instruction,
-              `Failing tool call: ${error.toolName}(${error.toolArgs})`,
-              `JSON Schema: ${JSON.stringify(parameterSchema({ toolName: error.toolName }))}`,
+              `Failing tool call: ${error.toolName}(${error.toolInput})`,
+              `JSON Schema: ${JSON.stringify(await inputSchema({ toolName: error.toolName }))}`,
             ].join('\n'),
           },
         ],
@@ -213,7 +252,7 @@ export function buildToolRuntime(input: {
       }
 
       emitRepair(input, error.toolName, 'repaired');
-      return { ...toolCall, args: JSON.stringify(parsed.data) };
+      return { ...toolCall, input: JSON.stringify(parsed.data) };
     } catch {
       emitRepair(input, error.toolName, 'failed');
       return null;
@@ -221,7 +260,7 @@ export function buildToolRuntime(input: {
   };
 
   for (const definition of input.definitions) {
-    const parameters = definition.onInvalidArguments
+    const inputSchema = definition.onInvalidArguments
       ? jsonSchema(zodToJsonSchema(definition.input), {
           validate: (value) => {
             const result = definition.input.safeParse(value);
@@ -241,34 +280,35 @@ export function buildToolRuntime(input: {
 
     tools[definition.name] = aiTool({
       description: definition.description,
-      parameters,
-      execute: async (args, options) => {
+      inputSchema,
+      execute: async (args: unknown, options) => {
         if (isInvalidArgumentsMarker(args)) {
           const result = await definition.onInvalidArguments!(args.rawArgs, args.error);
           if (result !== null) {
             emitRepair(input, definition.name, 'handled');
             return result;
           }
-          const invalidError = new InvalidToolArgumentsError({
+          const invalidError = new InvalidToolInputError({
             toolName: definition.name,
-            toolArgs: JSON.stringify(args.rawArgs),
+            toolInput: JSON.stringify(args.rawArgs),
             cause: args.error,
           });
           const repaired = await repairToolCall({
             toolCall: {
-              toolCallType: 'function',
+              type: 'tool-call',
               toolCallId: options.toolCallId,
               toolName: definition.name,
-              args: invalidError.toolArgs,
+              input: invalidError.toolInput,
             } as RepairToolCall,
             tools,
             error: invalidError,
             messages: options.messages,
+            instructions: undefined,
             system: undefined,
-            parameterSchema: () => zodToJsonSchema(definition.input),
+            inputSchema: async () => zodToJsonSchema(definition.input) as import('@ai-sdk/provider').JSONSchema7,
           });
           if (!repaired) throw invalidError;
-          const parsed = definition.input.parse(JSON.parse(repaired.args));
+          const parsed = definition.input.parse(JSON.parse(repaired.input));
           return executeHandler(
             definition,
             parsed,
